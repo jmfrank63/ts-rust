@@ -2863,7 +2863,8 @@ mod flat_arena {
     ///
     /// PERF (flatarena1 round 3): `items` is the first chunk of the R208
     /// chunked arena. It starts at `FIRST_CAPACITY` entries, doubles up to
-    /// `CHUNK_STEP`, then grows in steps of as many up to `CHUNK_LEN`. The
+    /// `CHUNK_STEP`, then grows in steps of as many up to `CHUNK_LEN`. When
+    /// it is full, it becomes the first chunk of `rest` (no copy), and the
     /// later entries go into `rest`. When `rest` would get its
     /// `MOVE_CHUNKS + 1`th chunk, the type arena of a large program moves
     /// every entry into a room (`planned_room`) and pushes into it from then
@@ -2871,15 +2872,20 @@ mod flat_arena {
     /// written entries become resident, and the pushes into it do not copy.
     /// When the room is full, the later entries go into `rest` again. So a
     /// small or mid-size program keeps the memory of the R208 chunks, and no
-    /// arena copies more than its first `MOVE_CHUNKS + 1` chunks (5 MiB of
+    /// arena copies more than its first `MOVE_CHUNKS` chunks (5 MiB of
     /// types).
     ///
     /// A read of `items` makes one test, the bounds check of one `Vec`. A
     /// read of `rest` makes that test, then one bounds check of `rest`: a
     /// chunk is an array, so its index needs no check (the R208 read made
-    /// two checks, the chunk table and the chunk).
+    /// two checks, the chunk table and the chunk). The test goes the same
+    /// way for every read of an arena with chunks and no room: with the
+    /// first chunk kept in `items`, it went both ways in a mid-size program,
+    /// and hono st took 0.7% fewer instructions but 3.3% more cycles than
+    /// R210 (kysely st 4.3 to 5.3% more; r3 ab-always, ab-madvise).
     pub struct ChunkedArena<T> {
-        /// Entries `0..items.len()`. Full while `rest` is not empty.
+        /// Entries `0..items.len()`: the first chunk, a room, or nothing.
+        /// Full or empty while `rest` is not empty.
         items: Vec<T>,
         /// The entries after `items`, `CHUNK_LEN` in each chunk. The slots
         /// after the last entry hold `T::default()` until a push replaces
@@ -2900,7 +2906,8 @@ mod flat_arena {
     const CHUNK_MASK: usize = CHUNK_LEN - 1;
     /// `items` doubles up to this many entries, then grows by as many.
     const CHUNK_STEP: usize = CHUNK_LEN / 4;
-    /// The full chunks in `rest` when the arena moves into its room.
+    /// The full chunks in `rest` (with the first chunk) when the arena
+    /// moves into its room.
     ///
     /// PERF (flatarena1 round 3): a room costs a few MiB of peak RSS under
     /// system THP `always`, used or not. Astro st (1.1 million nodes, 22,000
@@ -2908,7 +2915,7 @@ mod flat_arena {
     /// first chunk, and 0.8% with the move at 5 chunks (no room; r3 knob2,
     /// knob3). The 5 MiB that the move frees go back to jemalloc for the
     /// later allocations.
-    const MOVE_CHUNKS: usize = 4;
+    const MOVE_CHUNKS: usize = 5;
     /// Only an arena whose chunks hold at least this many bytes takes a
     /// room: the type arena (`Type` is 128 bytes). The mapper (16 bytes) and
     /// inference context (56 bytes) arenas hold few bytes, and their flat
@@ -3085,18 +3092,26 @@ mod flat_arena {
             self.items.push(make());
         }
 
-        /// Grows the full first chunk in `items`. False when it has
-        /// `CHUNK_LEN` entries, or `items` is a full room, and the entry goes
-        /// to `rest`.
+        /// Grows the full first chunk in `items`. When it has `CHUNK_LEN`
+        /// entries, it becomes the first chunk of `rest`. False when the
+        /// entry goes to `rest`.
         #[cold]
         #[inline(never)]
         fn grow(&mut self) -> bool {
             let cap = self.items.capacity();
-            if cap >= CHUNK_LEN {
-                return false;
+            if cap < CHUNK_LEN {
+                self.items.reserve_exact(cap.min(CHUNK_STEP));
+                return true;
             }
-            self.items.reserve_exact(cap.min(CHUNK_STEP));
-            true
+            if self.room_bytes == 0 {
+                let first: Box<[T]> = std::mem::take(&mut self.items).into_boxed_slice();
+                match first.try_into() {
+                    Ok(chunk) => self.rest.push(chunk),
+                    Err(_) => unreachable!("the first chunk has CHUNK_LEN entries"),
+                }
+                self.rest_len = CHUNK_LEN;
+            }
+            false
         }
 
         /// Pushes `value` at the end of `rest`, or into the room that `room`
@@ -3233,7 +3248,7 @@ mod flat_arena {
                 let flat = if arena.room_bytes > 0 {
                     8 * CHUNK_LEN
                 } else {
-                    CHUNK_LEN
+                    0
                 };
                 assert_eq!(arena.items.len(), flat);
                 assert_eq!(arena.rest_len, N - flat);
