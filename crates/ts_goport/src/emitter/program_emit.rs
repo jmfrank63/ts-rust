@@ -540,51 +540,132 @@ fn js_first_split(source_file: Node, target: &EmitterOptions) -> bool {
 /// The JS part of a file that `js_first_split` splits, after it ran on its
 /// checker thread (`js_part_on_checker`).
 enum CheckerJs {
-    /// The transforms ended: the d.ts part runs with this JS part.
-    Ended(PoolJs),
-    /// The transforms did not end (a panic): as in the file's whole emit, its
-    /// d.ts part does not run, and the file ends with this result (the result
-    /// of `wrap`) or this panic goes on.
+    /// The twins are off, and the JS part ended here (transforms, print and
+    /// writes). The d.ts part runs after it with `emit_nodes`, what the JS
+    /// transforms wrote on parse-tree nodes (ts#64649).
+    Printed {
+        result: EmitResult,
+        emit_nodes: Option<ParseEmitNodes>,
+    },
+    /// The twins are on, and the JS transforms ended: the twin prints this
+    /// part with the d.ts part, as `emit_on_twin` does (`TwinFile`).
+    Transformed {
+        js: TwinPart,
+        emit_nodes: Option<ParseEmitNodes>,
+    },
+    /// The JS part did not end (a panic in its transforms, or in its print
+    /// with the twins off): as in the file's whole emit, its d.ts part does
+    /// not run, and the file ends with this result (of `wrap`) or this panic
+    /// goes on.
     Stopped(std::thread::Result<EmitResult>),
 }
 
 impl CheckerJs {
-    /// The d.ts part of the file on its checker thread after this JS part, with
-    /// the result of the file's emit (`emit_declaration_part`). `target` is the
-    /// target of the whole emit.
+    /// The d.ts part of the file on its checker thread after this JS part,
+    /// with the result of the file's emit. `target` is the target of the
+    /// whole emit. With the twins on, the twin prints and writes the JS part
+    /// and then the d.ts part (`TwinFile::run`), as in `emit_on_twin`.
     fn declaration_part(
         self,
         source_file: Node,
-        target: EmitterOptions,
+        target: &EmitterOptions,
         wrap: Wrap,
         twin: DtsTwinMode,
     ) -> CheckerOutput {
+        let target = EmitterOptions {
+            emit_only: EmitOnly::Dts,
+            ..target.clone()
+        };
         match self {
-            CheckerJs::Ended(js_part) if twin == DtsTwinMode::Off => {
-                let target = EmitterOptions {
-                    emit_only: EmitOnly::Dts,
-                    ..target
-                };
-                CheckerOutput::Done(emit_declaration_part_here(
-                    source_file,
-                    &target,
-                    js_part,
-                    wrap,
-                ))
-            }
-            CheckerJs::Ended(js_part) => emit_declaration_part(source_file, target, js_part, wrap),
             CheckerJs::Stopped(result) => {
                 CheckerOutput::Done(result.unwrap_or_else(|payload| resume_unwind(payload)))
+            }
+            CheckerJs::Printed { result, emit_nodes } => {
+                // `emit_declaration_part_here` with the JS part ended.
+                let js_part = Rc::new(RefCell::new(PoolJsPart {
+                    job: None,
+                    result: Some(Ok(result)),
+                }));
+                let emit_nodes = RefCell::new(emit_nodes);
+                let ended = std::cell::Cell::new(false);
+                let dts = wrap(&|| {
+                    let mut emitter = new_emitter(
+                        new_emit_host(source_file),
+                        source_file,
+                        &target,
+                        Some(js_part.clone()),
+                    );
+                    if let Some(print) =
+                        emitter.transform_declaration_part(emit_nodes.borrow_mut().take())
+                    {
+                        emitter.finish_declaration_part(print);
+                    }
+                    emitter.writer = None;
+                    ended.set(true);
+                    emitter.emit_result
+                });
+                if !ended.get() {
+                    // `wrap` took a panic of the d.ts part: as around the
+                    // whole emit, its result is the file's result.
+                    return CheckerOutput::Done(dts);
+                }
+                let js = js_part
+                    .borrow_mut()
+                    .take_result()
+                    .unwrap_or_else(|payload| resume_unwind(payload));
+                CheckerOutput::Done(merge_emit_parts(js, dts))
+            }
+            CheckerJs::Transformed { js, emit_nodes } => {
+                // The second half of `emit_on_twin`.
+                let check = twin == DtsTwinMode::Check;
+                let js = RefCell::new(Some(js));
+                let emit_nodes = RefCell::new(emit_nodes);
+                let twin_file: RefCell<Option<TwinFile>> = RefCell::new(None);
+                let here = wrap(&|| {
+                    let dts = catch_unwind(AssertUnwindSafe(|| {
+                        let mut emitter =
+                            new_emitter(new_emit_host(source_file), source_file, &target, None);
+                        match emitter.transform_declaration_part(emit_nodes.borrow_mut().take()) {
+                            Some(print) => {
+                                TwinPart::Print(TwinPrint::declaration(emitter, print, check))
+                            }
+                            None => TwinPart::Done(emitter.emit_result),
+                        }
+                    }))
+                    .unwrap_or_else(TwinPart::Panicked);
+                    let file = TwinFile {
+                        js: js.borrow_mut().take().unwrap_or_default(),
+                        dts,
+                    };
+                    match file.done() {
+                        Ok(result) => result,
+                        Err(file) => {
+                            *twin_file.borrow_mut() = Some(file);
+                            EmitResult::default()
+                        }
+                    }
+                });
+                match twin_file.into_inner() {
+                    Some(file) => CheckerOutput::Twin(send_dts_twin_job(move || {
+                        let file = RefCell::new(Some(file));
+                        wrap(&|| {
+                            file.borrow_mut()
+                                .take()
+                                .expect("a twin file runs once")
+                                .run()
+                        })
+                    })),
+                    None => CheckerOutput::Done(here),
+                }
             }
         }
     }
 }
 
 /// The JS part of a file that `js_first_split` splits, on its checker
-/// thread: the transforms here, and the print here or on the twin of the
-/// checker (`twin`, as `emit_on_twin`). `wrap` is around the transforms and
-/// around the print. The d.ts part gets the JS part as a split file gets its
-/// pool JS part (`emit_declaration_part`).
+/// thread: the transforms, then the print here (`twin` is `Off`), or later on
+/// the twin of the checker with the d.ts part (`CheckerJs::Transformed`, as
+/// `emit_on_twin`). `wrap` is around the part.
 fn js_part_on_checker(
     source_file: Node,
     target: &EmitterOptions,
@@ -595,50 +676,39 @@ fn js_part_on_checker(
         emit_only: EmitOnly::Js,
         ..target.clone()
     };
-    let (sender, receiver) = sync_channel(1);
-    let twin_print: RefCell<Option<TwinPrint>> = RefCell::new(None);
-    let ended = std::cell::Cell::new(false);
+    let ended: RefCell<Option<CheckerJs>> = RefCell::new(None);
     let here = catch_unwind(AssertUnwindSafe(|| {
         wrap(&|| {
             let mut emitter = new_emitter(new_emit_host(source_file), source_file, &target, None);
             let print = emitter.transform_js_part();
-            ended.set(true);
+            let emit_nodes = print
+                .as_ref()
+                .map(|print| print.emit_context.export_parse_emit_nodes());
+            if twin != DtsTwinMode::Off {
+                let js = match print {
+                    Some(print) => {
+                        TwinPart::Print(TwinPrint::js(emitter, print, twin == DtsTwinMode::Check))
+                    }
+                    None => TwinPart::Done(emitter.emit_result),
+                };
+                *ended.borrow_mut() = Some(CheckerJs::Transformed { js, emit_nodes });
+                return EmitResult::default();
+            }
             if let Some(print) = print {
-                // The channel holds one value, and only this job sends.
-                let _ = sender.try_send(print.emit_context.export_parse_emit_nodes());
-                if twin == DtsTwinMode::Off {
-                    emitter.finish_js_part(print);
-                } else {
-                    *twin_print.borrow_mut() =
-                        Some(TwinPrint::js(emitter, print, twin == DtsTwinMode::Check));
-                    return EmitResult::default();
-                }
+                emitter.finish_js_part(print);
             }
             emitter.writer = None;
-            emitter.emit_result
+            *ended.borrow_mut() = Some(CheckerJs::Printed {
+                result: emitter.emit_result,
+                emit_nodes,
+            });
+            EmitResult::default()
         })
     }));
-    drop(sender);
-    if !ended.get() {
-        return CheckerJs::Stopped(here);
+    match (here, ended.into_inner()) {
+        (Ok(_), Some(ended)) => ended,
+        (here, _) => CheckerJs::Stopped(here),
     }
-    let job = match (here, twin_print.into_inner()) {
-        (Ok(_), Some(print)) => send_dts_twin_job(move || {
-            let print = RefCell::new(Some(print));
-            wrap(&|| {
-                print
-                    .borrow_mut()
-                    .take()
-                    .expect("a twin print runs once")
-                    .print(None)
-            })
-        }),
-        (here, _) => crate::program::EmitPoolJob::ready(here),
-    };
-    CheckerJs::Ended(PoolJs {
-        job,
-        emit_nodes: receiver,
-    })
 }
 
 /// The emit jobs of `files` on their checker threads with the emit pool off
@@ -688,7 +758,7 @@ fn send_file_emits(
             .remove(&source_file);
         match js_part {
             Some(js_part) => {
-                match js_part.declaration_part(source_file, target, wrap, DtsTwinMode::Off) {
+                match js_part.declaration_part(source_file, &target, wrap, DtsTwinMode::Off) {
                     CheckerOutput::Done(result) => result,
                     CheckerOutput::Twin(_) => unreachable!("no twin with the emit pool off"),
                 }
@@ -988,7 +1058,7 @@ fn start_emit_files_with_pool(
                 .remove(&source_file)
                 .expect("one checker part per file");
             if let Some(checker_js) = part.checker_js {
-                return checker_js.declaration_part(source_file, part.target, wrap, twin_mode);
+                return checker_js.declaration_part(source_file, &part.target, wrap, twin_mode);
             }
             match part.js_part {
                 Some(js_part) => emit_declaration_part(source_file, part.target, js_part, wrap),
