@@ -631,6 +631,25 @@ pub fn emit_pool_enabled() -> bool {
 pub struct EmitPoolJob<R>(JobReceiver<R>);
 
 impl<R> EmitPoolJob<R> {
+    /// A job that already ended with `result` (the JS part of a file that
+    /// `program_emit` splits on its checker thread).
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn ready(result: std::thread::Result<R>) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _ = sender.send(result);
+        EmitPoolJob(receiver)
+    }
+
+    /// wasm: `ready`. A panic aborts on wasm, so `result` is never `Err`.
+    #[cfg(target_family = "wasm")]
+    #[must_use]
+    pub fn ready(result: std::thread::Result<R>) -> Self {
+        EmitPoolJob(JobReceiver(
+            result.unwrap_or_else(|payload| std::panic::resume_unwind(payload)),
+        ))
+    }
+
     /// Waits for the job. `Err` holds the payload of its panic.
     pub fn join(self) -> std::thread::Result<R> {
         #[cfg(not(target_family = "wasm"))]
@@ -5854,6 +5873,23 @@ impl<R> PendingCheckerJobs<R> {
             .into_iter()
             .map(|result| result.unwrap_or_else(|payload| std::panic::resume_unwind(payload)))
             .collect()
+    }
+
+    /// The jobs of files that were sent in `order` (job `k` is the job of
+    /// file `order[k]`), put back in file order.
+    #[must_use]
+    pub fn into_file_order(self, order: &[usize]) -> Self {
+        debug_assert_eq!(self.0.len(), order.len());
+        let mut slots: Vec<Option<CheckerJob<R>>> = (0..order.len()).map(|_| None).collect();
+        for (job, &index) in self.0.into_iter().zip(order) {
+            slots[index] = Some(job);
+        }
+        PendingCheckerJobs(
+            slots
+                .into_iter()
+                .map(|job| job.expect("one job per file"))
+                .collect(),
+        )
     }
 
     /// `wait` that returns each job's result or the payload of its panic,

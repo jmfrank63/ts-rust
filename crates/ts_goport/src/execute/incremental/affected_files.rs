@@ -593,6 +593,22 @@ pub fn collect_all_affected_files(program: &Program) {
         .iter()
         .cloned()
         .collect();
+    // PORT: Go runs both loops on work groups over `SyncSet` Range order
+    // (random per process). Each `computeDtsSignature` is a d.ts emit of one
+    // file (affectedfileshandler.go:69), and where its widenings come first
+    // sets the d.ts text, so the order counts. Parallel, the goroutines race
+    // on each checker as the d.ts parts of `Program.Emit` do, and the port
+    // takes the same order (`dts_order`).
+    let changed_files: Vec<Path> = {
+        let files: Vec<Node> = changed_files
+            .iter()
+            .map(|path| get_source_file_by_path(path))
+            .collect();
+        signature_order(&files)
+            .into_iter()
+            .map(|index| changed_files[index].clone())
+            .collect()
+    };
     for file in &changed_files {
         for affected_file in handler.get_files_affected_by(file) {
             result.insert(affected_file);
@@ -602,7 +618,11 @@ pub fn collect_all_affected_files(program: &Program) {
     // For all the affected files, get all the files that would need to change their dts or js files,
     // update their diagnostics
     let emit_kind = get_file_emit_kind(program.snapshot.borrow().options);
-    for file in result {
+    let result: Vec<Node> = result.into_iter().collect();
+    for file in signature_order(&result)
+        .into_iter()
+        .map(|index| result[index])
+    {
         // remove the cached semantic diagnostics and handle dts emit and js emit if needed
         let dts_may_change = handler.get_dts_may_change(path_of(file), emit_kind);
         handler.handle_dts_may_change_of_affected_file(dts_may_change, file);
@@ -610,4 +630,21 @@ pub fn collect_all_affected_files(program: &Program) {
 
     // Update the snapshot with the new state
     handler.update_snapshot();
+}
+
+/// The order of the signature loops of `collect_all_affected_files`, as
+/// indices into `files` (a nil file is a path with no source file: it goes
+/// last in the parallel order, as it emits nothing).
+fn signature_order(files: &[Node]) -> Vec<usize> {
+    if crate::program::single_threaded() {
+        return (0..files.len()).collect();
+    }
+    let known: Vec<usize> = (0..files.len()).filter(|&k| !files[k].is_nil()).collect();
+    let known_files: Vec<Node> = known.iter().map(|&k| files[k]).collect();
+    let mut order: Vec<usize> = match crate::emitter::program_emit::dts_order(&known_files) {
+        Some(order) => order.into_iter().map(|k| known[k]).collect(),
+        None => known,
+    };
+    order.extend((0..files.len()).filter(|&k| files[k].is_nil()));
+    order
 }

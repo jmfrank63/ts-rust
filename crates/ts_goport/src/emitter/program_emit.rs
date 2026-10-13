@@ -167,9 +167,7 @@ fn emit_results_with(
         .map(PendingPoolEmit::wait);
     match pooled {
         Some(results) => results,
-        None => run_emit_jobs(source_files, move |source_file| {
-            wrap(&|| emit_source_file(source_file, &target))
-        }),
+        None => run_emit_jobs(source_files, target, wrap),
     }
 }
 
@@ -232,8 +230,9 @@ pub fn start_emit_batch(targets: Vec<EmitOptions>) -> PendingEmitBatch {
 /// inside a work group, so the files emit in parallel. `emit_files_incremental`
 /// builds one `EmitOptions` per pending file (one target file each, from
 /// `get_emit_options`) and calls this once instead of `emit` per file.
-/// Each checker thread runs its files in `targets` order, also with
-/// `--singleThreaded`.
+/// Each checker thread runs its files as `Program.Emit` does
+/// (`js_first_split`, `dts_order`); with `--singleThreaded`, in `targets`
+/// order.
 ///
 /// Each target must name one source file, and no file can be in the batch
 /// twice. With `noEmitOnError` each target runs through `emit_with`, one at
@@ -349,28 +348,22 @@ pub fn start_emit_batch_with(
         }
     }
 
-    // PORT: the batch runs in `targets` order on each checker thread, also with
-    // `--singleThreaded`. Go `emitFilesIncremental` queues the files in SyncMap
-    // Range order, which is random, and its single-threaded work group runs them
-    // last-queued-first. The port keeps the order of the one-file loop that the
-    // batch replaces, so each checker does the same work in the same order.
-    // With the pool, no trace is written (`emit_pool_enabled`), so there is
-    // no trace event per target.
+    // PORT: Go `emitFilesIncremental` queues the files in SyncMap Range order,
+    // which is random. In parallel the goroutines of one checker race as in
+    // `Program.Emit`, and the batch runs as `Program.Emit` does
+    // (`js_first_split`, `dts_order`). Go's single-threaded work group runs
+    // them last-queued-first; here they run in `targets` order, the order of
+    // the one-file loop that the batch replaces. With the pool, no trace is
+    // written (`emit_pool_enabled`), so there is no trace event per target.
     let pooled = start_emit_files_with_pool(&files, |file| file_targets[&file].clone(), wrap);
     let jobs = match pooled {
         Some(pool) => PendingFiles::Pool(pool),
         None => {
             // The closure gets only the file, so it finds the file's target here.
             let file_targets = Arc::new(file_targets);
-            PendingFiles::Checkers(send_on_checker_threads_for_files(
-                &files,
-                move |source_file| {
-                    // One Go `Program.Emit` trace event per target, on the emit thread.
-                    let _trace = trace_emit();
-                    let target = &file_targets[&source_file];
-                    wrap(&|| emit_source_file(source_file, target))
-                },
-            ))
+            let (_js_first, jobs) =
+                send_file_emits(&files, move |file| file_targets[&file].clone(), true, wrap);
+            PendingFiles::Checkers(jobs)
         }
     };
     PendingEmitBatch(PendingBatch::Sent {
@@ -513,13 +506,254 @@ fn trace_emit() -> Option<crate::tracing::Pop> {
     crate::tracing::get().map(|tr| tr.push(crate::tracing::Phase::Emit, "emit", Vec::new(), true))
 }
 
-/// Runs `job(file)` for each file on the file's checker thread and returns
-/// the results in file order. Each checker thread runs its jobs in the
-/// order they are sent (FIFO).
-fn run_emit_jobs(
-    files: Vec<Node>,
-    job: impl Fn(Node) -> EmitResult + Send + Sync + 'static,
-) -> Vec<EmitResult> {
+/// PORT: Go `Program.Emit` runs one goroutine per file
+/// (compiler/program.go:1913-1954), and the emit resolver locks the checker
+/// for each call (checker/emitresolver.go:57, :73), so the emits of one
+/// checker interleave call by call. Each goroutine runs its JS part, then its
+/// d.ts part (emitter.go:52-53). The first checker call of a JS part is
+/// mostly `MarkLinkedReferencesRecursively` (importelision.go:29,
+/// emitresolver.go:498), a walk of the whole file that can widen types. All
+/// goroutines start within some ms and the JS parts take most of the emit,
+/// so these calls come near file order, before most d.ts parts start; then
+/// the d.ts parts race (dtsorder1 `go-model.md`). A checker thread runs one
+/// job at a time. So with more than one thread the port sends, to each
+/// checker, the JS part of each file whose JS part needs the checker first,
+/// in file order, and then the d.ts parts in `dts_order`. Where a type or an
+/// undefined-property symbol (checker.go:18900) is made first sets the order
+/// of union members and of `x?: undefined` members in the d.ts text. Single
+/// threaded, Go runs each file whole, last queued first, and so does the
+/// port (`run_emit_jobs`).
+fn js_first_split(source_file: Node, target: &EmitterOptions) -> bool {
+    if single_threaded() || target.force_emit || target.emit_only != EmitOnly::All {
+        return false;
+    }
+    let options = options();
+    // The tests of `file_emit`: a JS part and a d.ts part.
+    !options.emit_declaration_only.is_true()
+        && !options.no_emit.is_true()
+        && source_file_content_mapper(source_file).is_empty()
+        && options.get_emit_declarations()
+        && !is_json_source_file(source_file)
+        && js_emit_needs_checker(source_file)
+}
+
+/// The JS part of a file that `js_first_split` splits, after it ran on its
+/// checker thread (`js_part_on_checker`).
+enum CheckerJs {
+    /// The transforms ended: the d.ts part runs with this JS part.
+    Ended(PoolJs),
+    /// The transforms did not end (a panic): as in the file's whole emit, its
+    /// d.ts part does not run, and the file ends with this result (the result
+    /// of `wrap`) or this panic goes on.
+    Stopped(std::thread::Result<EmitResult>),
+}
+
+impl CheckerJs {
+    /// The d.ts part of the file on its checker thread after this JS part, with
+    /// the result of the file's emit (`emit_declaration_part`). `target` is the
+    /// target of the whole emit.
+    fn declaration_part(
+        self,
+        source_file: Node,
+        target: EmitterOptions,
+        wrap: Wrap,
+        twin: DtsTwinMode,
+    ) -> CheckerOutput {
+        match self {
+            CheckerJs::Ended(js_part) if twin == DtsTwinMode::Off => {
+                let target = EmitterOptions {
+                    emit_only: EmitOnly::Dts,
+                    ..target
+                };
+                CheckerOutput::Done(emit_declaration_part_here(
+                    source_file,
+                    &target,
+                    js_part,
+                    wrap,
+                ))
+            }
+            CheckerJs::Ended(js_part) => emit_declaration_part(source_file, target, js_part, wrap),
+            CheckerJs::Stopped(result) => {
+                CheckerOutput::Done(result.unwrap_or_else(|payload| resume_unwind(payload)))
+            }
+        }
+    }
+}
+
+/// The JS part of a file that `js_first_split` splits, on its checker
+/// thread: the transforms here, and the print here or on the twin of the
+/// checker (`twin`, as `emit_on_twin`). `wrap` is around the transforms and
+/// around the print. The d.ts part gets the JS part as a split file gets its
+/// pool JS part (`emit_declaration_part`).
+fn js_part_on_checker(
+    source_file: Node,
+    target: &EmitterOptions,
+    wrap: Wrap,
+    twin: DtsTwinMode,
+) -> CheckerJs {
+    let target = EmitterOptions {
+        emit_only: EmitOnly::Js,
+        ..target.clone()
+    };
+    let (sender, receiver) = sync_channel(1);
+    let twin_print: RefCell<Option<TwinPrint>> = RefCell::new(None);
+    let ended = std::cell::Cell::new(false);
+    let here = catch_unwind(AssertUnwindSafe(|| {
+        wrap(&|| {
+            let mut emitter = new_emitter(new_emit_host(source_file), source_file, &target, None);
+            let print = emitter.transform_js_part();
+            ended.set(true);
+            if let Some(print) = print {
+                // The channel holds one value, and only this job sends.
+                let _ = sender.try_send(print.emit_context.export_parse_emit_nodes());
+                if twin == DtsTwinMode::Off {
+                    emitter.finish_js_part(print);
+                } else {
+                    *twin_print.borrow_mut() =
+                        Some(TwinPrint::js(emitter, print, twin == DtsTwinMode::Check));
+                    return EmitResult::default();
+                }
+            }
+            emitter.writer = None;
+            emitter.emit_result
+        })
+    }));
+    drop(sender);
+    if !ended.get() {
+        return CheckerJs::Stopped(here);
+    }
+    let job = match (here, twin_print.into_inner()) {
+        (Ok(_), Some(print)) => send_dts_twin_job(move || {
+            let print = RefCell::new(Some(print));
+            wrap(&|| {
+                print
+                    .borrow_mut()
+                    .take()
+                    .expect("a twin print runs once")
+                    .print(None)
+            })
+        }),
+        (here, _) => crate::program::EmitPoolJob::ready(here),
+    };
+    CheckerJs::Ended(PoolJs {
+        job,
+        emit_nodes: receiver,
+    })
+}
+
+/// The emit jobs of `files` on their checker threads with the emit pool off
+/// (`run_emit_jobs`, `start_emit_batch_with`): the JS parts of the files that
+/// `js_first_split` splits, in file order, then each other file's whole emit
+/// and each split file's d.ts part, in `dts_order`. `trace_each`: one Go
+/// `Program.Emit` trace event per file, on the emit thread (the batch).
+/// Returns the jobs of the JS parts, when there are any, and the jobs of the
+/// files, whose results are in file order.
+fn send_file_emits(
+    files: &[Node],
+    target_of: impl Fn(Node) -> EmitterOptions + Send + Sync + 'static,
+    trace_each: bool,
+    wrap: Wrap,
+) -> (
+    Option<PendingCheckerJobs<()>>,
+    PendingCheckerJobs<EmitResult>,
+) {
+    let target_of = Arc::new(target_of);
+    let split: Vec<Node> = files
+        .iter()
+        .copied()
+        .filter(|&file| js_first_split(file, &target_of(file)))
+        .collect();
+    // Each checker thread runs its jobs in the order they are sent, so a JS
+    // part puts its result here before the d.ts part of its file reads it.
+    let js_parts: Arc<Mutex<FxHashMap<Node, CheckerJs>>> = Arc::default();
+    let js_jobs = (!split.is_empty()).then(|| {
+        let js_parts = Arc::clone(&js_parts);
+        let target_of = Arc::clone(&target_of);
+        send_on_checker_threads_for_files(&split, move |source_file| {
+            // The twins print only with the emit pool on.
+            let js =
+                js_part_on_checker(source_file, &target_of(source_file), wrap, DtsTwinMode::Off);
+            js_parts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(source_file, js);
+        })
+    });
+    let jobs = send_emit_jobs(files, move |source_file| {
+        let _trace = if trace_each { trace_emit() } else { None };
+        let target = target_of(source_file);
+        let js_part = js_parts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&source_file);
+        match js_part {
+            Some(js_part) => {
+                match js_part.declaration_part(source_file, target, wrap, DtsTwinMode::Off) {
+                    CheckerOutput::Done(result) => result,
+                    CheckerOutput::Twin(_) => unreachable!("no twin with the emit pool off"),
+                }
+            }
+            None => wrap(&|| emit_source_file(source_file, &target)),
+        }
+    });
+    (js_jobs, jobs)
+}
+
+/// PORT: the order in which the d.ts parts of `files` go to each checker
+/// thread, as indices into `files`, or None to keep the order of `files`
+/// (one file, or `--singleThreaded`). In Go the d.ts parts of one checker
+/// race (`js_first_split`): the first widening of a name can come from any
+/// of them, and a file's d.ts text depends only on whether that file comes
+/// before it (utilities.go:392-411). Go has a 90 percent answer for a file
+/// only when most of the files that make the widening are on one side of it.
+/// The order of `files` gives the first file of them, and its reverse (the
+/// Go `--singleThreaded` order) gives the last; both are the wrong side for
+/// the files near that end. So each checker starts in the middle of its
+/// files and goes back to the first, then from the last back to the middle:
+/// on a long race the first widening comes from the middle, and on a short
+/// one it comes from the later file, as Go does on most runs (dtsorder1
+/// `summary.md`). Only the order within a checker counts: each checker
+/// thread runs its jobs in the order they are sent.
+pub(crate) fn dts_order(files: &[Node]) -> Option<Vec<usize>> {
+    if files.len() < 2 || single_threaded() {
+        return None;
+    }
+    let mut checkers: Vec<Vec<usize>> = Vec::new();
+    for (index, &file) in files.iter().enumerate() {
+        let checker = crate::program::checker_index_of_file(file);
+        if checkers.len() <= checker {
+            checkers.resize_with(checker + 1, Vec::new);
+        }
+        checkers[checker].push(index);
+    }
+    let mut order = Vec::with_capacity(files.len());
+    for indices in checkers.iter().filter(|indices| !indices.is_empty()) {
+        let middle = indices.len() / 2;
+        order.extend(indices[..=middle].iter().rev());
+        order.extend(indices[middle + 1..].iter().rev());
+    }
+    Some(order)
+}
+
+/// `send_on_checker_threads_for_files` of emit jobs in `dts_order`. The
+/// results stay in file order.
+fn send_emit_jobs<R: Send + 'static>(
+    files: &[Node],
+    job: impl Fn(Node) -> R + Send + Sync + 'static,
+) -> PendingCheckerJobs<R> {
+    match dts_order(files) {
+        None => send_on_checker_threads_for_files(files, job),
+        Some(order) => {
+            let sent: Vec<Node> = order.iter().map(|&index| files[index]).collect();
+            send_on_checker_threads_for_files(&sent, job).into_file_order(&order)
+        }
+    }
+}
+
+/// The emit of `files` with `target` on their checker threads with the emit
+/// pool off (`send_file_emits`), with the results in file order. Each
+/// checker thread runs its jobs in the order they are sent (FIFO).
+fn run_emit_jobs(files: Vec<Node>, target: EmitterOptions, wrap: Wrap) -> Vec<EmitResult> {
     // Go `core.singleThreadedWorkGroup` runs the queued emits
     // last-queued-first (core/workgroup.go:67). With one checker thread the
     // jobs run in the order they are sent, so send them reversed.
@@ -528,7 +762,14 @@ fn run_emit_jobs(
     if last_queued_first {
         queued.reverse();
     }
-    let mut results = wait_emit_jobs(|| run_on_checker_threads_for_files(&queued, job));
+    let mut results = wait_emit_jobs(|| {
+        let (js_first, jobs) = send_file_emits(&queued, move |_| target.clone(), false, wrap);
+        let results = jobs.wait();
+        if let Some(js_first) = js_first {
+            js_first.wait();
+        }
+        results
+    });
     if last_queued_first {
         results.reverse();
     }
@@ -608,6 +849,9 @@ struct CheckerPart {
     /// The JS part on the emit pool when the file's emit is split; this is
     /// then the d.ts part.
     js_part: Option<PoolJs>,
+    /// The JS part on this checker thread when `js_first_split` splits the
+    /// file (`js_part_on_checker`); this is then the d.ts part.
+    checker_js: Option<CheckerJs>,
 }
 
 /// The JS part of a split file on the emit pool, as its d.ts part sees it.
@@ -637,9 +881,10 @@ impl PoolJs {
 ///
 /// First the JS part of each file that `file_emit` moves goes to the emit
 /// pool, in file order. Then the rest goes to the checker threads exactly
-/// as with the pool off: each checker thread gets its files in file order,
-/// with the whole emit or the d.ts part, so each checker gets the same
-/// checker calls in the same order. The JS part makes no checker call.
+/// as with the pool off: each checker thread gets the JS parts of the files
+/// that `js_first_split` splits, in file order, then the whole emits and the
+/// d.ts parts in `dts_order`, so each checker gets the same checker calls in
+/// the same order. The JS part on the pool makes no checker call.
 /// A d.ts part waits for the JS transforms of its file before its own
 /// transforms (ts#64649, `PoolJs::js_emit_nodes`), and for its JS part
 /// before it writes (`Emitter::js_part`), so the outputs of a file are
@@ -688,10 +933,14 @@ fn start_emit_files_with_pool(
     let mut checker_files = Vec::new();
     let mut checker_parts = FxHashMap::default();
     let mut on_pool = Vec::new();
+    let mut js_first_files = Vec::new();
     for (index, (&file, &way)) in files.iter().zip(&ways).enumerate() {
         if way == FileEmit::OnPool {
             on_pool.push((index, pool_jobs.next().expect("a pool job per pool file")));
             continue;
+        }
+        if way == FileEmit::OnChecker && js_first_split(file, &target(file)) {
+            js_first_files.push(file);
         }
         let js_part = (way == FileEmit::Split).then(|| PoolJs {
             job: pool_jobs.next().expect("a pool job per split file"),
@@ -705,19 +954,42 @@ fn start_emit_files_with_pool(
             CheckerPart {
                 target: target(file),
                 js_part,
+                checker_js: None,
             },
         );
     }
 
     // The closure gets only the file, so it takes the file's part here.
-    let checker_parts = Mutex::new(checker_parts);
+    let checker_parts = Arc::new(Mutex::new(checker_parts));
+    // `js_first_split`: the JS parts of the split files first, in file
+    // order. Each checker thread runs its jobs in the order they are sent, so
+    // a JS part puts its result in the file's part before the d.ts part
+    // takes it.
+    let js_first_jobs = (!js_first_files.is_empty()).then(|| {
+        let parts = Arc::clone(&checker_parts);
+        send_on_checker_threads_for_files(&js_first_files, move |source_file| {
+            let target = parts.lock().unwrap_or_else(PoisonError::into_inner)[&source_file]
+                .target
+                .clone();
+            let js = js_part_on_checker(source_file, &target, wrap, twin_mode);
+            parts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_mut(&source_file)
+                .expect("a part per JS-first file")
+                .checker_js = Some(js);
+        })
+    });
     let checker = catch_unwind(AssertUnwindSafe(|| {
-        send_on_checker_threads_for_files(&checker_files, move |source_file| {
+        send_emit_jobs(&checker_files, move |source_file| {
             let part = checker_parts
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&source_file)
                 .expect("one checker part per file");
+            if let Some(checker_js) = part.checker_js {
+                return checker_js.declaration_part(source_file, part.target, wrap, twin_mode);
+            }
             match part.js_part {
                 Some(js_part) => emit_declaration_part(source_file, part.target, js_part, wrap),
                 None if twin_mode != DtsTwinMode::Off && twin_can_print(&part.target) => {
@@ -731,6 +1003,7 @@ fn start_emit_files_with_pool(
         file_count: files.len(),
         checker,
         on_pool,
+        js_first_jobs,
     })
 }
 
@@ -752,6 +1025,9 @@ struct PendingPoolEmit {
     checker: std::thread::Result<PendingCheckerJobs<CheckerOutput>>,
     /// The files whose whole emit runs on the pool, by file position.
     on_pool: Vec<(usize, EmitPoolJob<EmitResult>)>,
+    /// The jobs of the JS parts of `js_first_split` (each keeps its panic in
+    /// its `PoolJs`).
+    js_first_jobs: Option<PendingCheckerJobs<()>>,
 }
 
 impl PendingPoolEmit {
@@ -764,6 +1040,9 @@ impl PendingPoolEmit {
 
     /// `wait` without `wait_emit_jobs`.
     fn wait_here(self) -> Vec<EmitResult> {
+        if let Some(jobs) = self.js_first_jobs {
+            jobs.wait();
+        }
         let checker_results = self.checker.map(|jobs| {
             jobs.wait_all()
                 .into_iter()
