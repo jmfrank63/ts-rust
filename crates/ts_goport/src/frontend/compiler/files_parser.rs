@@ -240,6 +240,25 @@ impl ParseTask {
         }
     }
 
+    /// Gives a loaded task the other lib status, with the metadata and lib
+    /// count that `load` gives a task of that status
+    /// (`FilesParser::settle_lib_races`).
+    // PORT: not in Go.
+    fn set_lib_file(&mut self, loader: &FileLoader, lib_file: Option<Rc<LibFile>>) {
+        let count = loader.lib_file_count.get();
+        if lib_file.is_some() {
+            loader.lib_file_count.set(count + 1);
+            self.metadata = SourceFileMetaData {
+                implied_node_format: ModuleKind::COMMON_JS,
+                ..Default::default()
+            };
+        } else {
+            loader.lib_file_count.set(count - 1);
+            self.metadata = loader.load_source_file_meta_data(&self.normalized_file_path);
+        }
+        self.lib_file = lib_file;
+    }
+
     // Go: filesparser.go:187 (*parseTask).redirect
     pub fn redirect(&mut self, _loader: &FileLoader, file_name: &str) {
         let redirected = Rc::new(RefCell::new(ParseTask {
@@ -309,6 +328,51 @@ pub struct ResolvedRef {
     pub package_id: PackageId,
 }
 
+/// True when `task` reaches a path whose first task of the same file name
+/// differs from it in lib status (`FilesParser::lib_races`).
+// PERF: no hash of the name on each repeated arrival. A path has one task
+// per file name casing, mostly one, and the names are compared only when
+// the lib status differs.
+fn is_lib_race(data: &ParseTaskData, task: &ParseTask) -> bool {
+    data.tasks.values().any(|first| {
+        let first = first.borrow();
+        first.lib_file.is_some() != task.lib_file.is_some()
+            && first.normalized_file_path == task.normalized_file_path
+    })
+}
+
+/// The model time from the start of `task`, the first task of `data` to
+/// reach it, to the start of its sub tasks in Go's parallel load
+/// (`FilesParser::settle_lib_races`), in tenths of the load of a small lib
+/// file. From Go N prime runs (bundledpath1 go-model.md): a root file
+/// takes about 2 small lib files (its package.json scope lookup is cold),
+/// each later file of an import chain about 0.4, the automatic type
+/// directives about 0.8 (no parse), and the parse adds about 1 per 64 KiB
+/// of text (`lib.dom.d.ts`, 2.4 MB, took as long as 36 small lib files).
+fn lib_race_cost(task: &ParseTask, data: &ParseTaskData, root: bool) -> u64 {
+    const LIB_FILE: u64 = 10;
+    const FILE: u64 = 4;
+    const ROOT_FILE: u64 = 20;
+    const AUTOMATIC_TYPES: u64 = 8;
+    const BYTES_PER_TENTH: u64 = 6554;
+    if task.is_for_automatic_type_directive {
+        return AUTOMATIC_TYPES;
+    }
+    let bytes = data
+        .tasks
+        .values()
+        .find_map(|task| task.borrow().file.as_ref().map(|file| file.text().len()))
+        .unwrap_or(0) as u64;
+    let start = if task.lib_file.is_some() {
+        LIB_FILE
+    } else if root {
+        ROOT_FILE
+    } else {
+        FILE
+    };
+    start + bytes / BYTES_PER_TENTH
+}
+
 /// Sets the path of a task that `FilesParser::start` queues: the one it
 /// came with (Go `task.path`, ts#64159), else the loader's `to_path` of its
 /// file name.
@@ -362,6 +426,11 @@ pub struct FilesParser {
     pub max_depth: i32,
     /// Go `singleThreaded`: no parse workers.
     pub single_threaded: bool,
+    /// The task data of each path that a lib task and a task that is not a
+    /// lib task (an import, a reference) both reached under one file name,
+    /// in a load that is not single threaded (`start`).
+    /// `settle_lib_races` gives each the lib status of Go's parallel load.
+    pub(crate) lib_races: Vec<Rc<RefCell<ParseTaskData>>>,
 }
 
 // PORT: Go's garbage collector frees the parse tasks with the loader. Here
@@ -459,6 +528,15 @@ fn all_roots_cached(
 impl FilesParser {
     // Go: filesparser.go:268 (*filesParser).parse
     pub fn parse(&mut self, loader: &FileLoader, tasks: &[ParseTaskRef]) {
+        self.load(loader, tasks);
+        if !self.lib_races.is_empty() {
+            self.settle_lib_races(loader, tasks);
+        }
+    }
+
+    /// Queues the root tasks and runs the queue until it is empty, with
+    /// the parse workers unless single threaded.
+    fn load(&mut self, loader: &FileLoader, tasks: &[ParseTaskRef]) {
         if PREFETCH.with(|p| p.borrow().is_some()) {
             self.run(loader, tasks);
             return;
@@ -670,6 +748,12 @@ impl FilesParser {
                     // loads the file later (a job to move up).
                     if prefetch.is_some() && data.borrow().lowest_depth == i32::MAX {
                         requests.extend(self.prefetch_request(loader, &task.borrow(), None, depth));
+                    }
+                    if !self.single_threaded
+                        && is_lib_race(&data.borrow(), &task.borrow())
+                        && !self.lib_races.iter().any(|race| Rc::ptr_eq(race, &data))
+                    {
+                        self.lib_races.push(data.clone());
                     }
                     (data.clone(), true)
                 }
@@ -894,6 +978,81 @@ impl FilesParser {
                 // borrows only the subtasks, which are tasks of their own.
                 let parent = task_by_file_name.borrow();
                 self.start(loader, &parent.sub_tasks, lowest_depth);
+            }
+        }
+    }
+
+    /// Gives each path of `lib_races` the lib status that Go's parallel
+    /// load most often gives it.
+    ///
+    /// In Go the first task of a path to reach `LoadOrStore` (`start`)
+    /// loads the file, and `collectFiles` makes the file a lib file only
+    /// when that task is a lib task. Each task runs on its own goroutine,
+    /// so when a lib reference chain and an import (or a reference) reach
+    /// the same lib file, the faster route wins: `paths` to
+    /// `lib.es5.d.ts` with the default lib puts it after the other libs,
+    /// but `lib: ["es2015"]` keeps it at its lib place. The queue here
+    /// runs in Go's single threaded order, where the lib route always
+    /// loads first. This replays the load on a model clock: a root task
+    /// starts at 0, and the sub tasks of the task that reached a path
+    /// first start when its load ends (`lib_race_cost`). Where that task
+    /// differs in lib status from the task that loaded the file here, the
+    /// loaded task takes its status.
+    // PORT: not in Go, whose answer depends on goroutine timing. The model
+    // follows Go's answer where Go gives one answer in at least 90 percent
+    // of the runs (bundledpath1, 2026-10-13). Single threaded loads keep
+    // Go's single threaded answer (no races are noted).
+    fn settle_lib_races(&mut self, loader: &FileLoader, roots: &[ParseTaskRef]) {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        use std::collections::hash_map::Entry;
+
+        // The tasks in the order they reached the model clock, whether each
+        // is a root task, and the heap of (start time, index).
+        let mut tasks: Vec<(ParseTaskRef, bool)> =
+            roots.iter().map(|task| (task.clone(), true)).collect();
+        let mut starts: BinaryHeap<Reverse<(u64, usize)>> =
+            (0..tasks.len()).map(|index| Reverse((0, index))).collect();
+        // The index of the first task that reached each path.
+        let mut first: FxHashMap<*const RefCell<ParseTaskData>, usize> = FxHashMap::default();
+        while let Some(Reverse((time, index))) = starts.pop() {
+            let (task, root) = tasks[index].clone();
+            let Some(data) = task.borrow().data.upgrade() else {
+                continue;
+            };
+            let Entry::Vacant(entry) = first.entry(Rc::as_ptr(&data)) else {
+                continue;
+            };
+            entry.insert(index);
+            let data = data.borrow();
+            let done = time + lib_race_cost(&task.borrow(), &data, root);
+            for loaded in data.tasks.values() {
+                for sub_task in &loaded.borrow().sub_tasks {
+                    tasks.push((sub_task.clone(), false));
+                    starts.push(Reverse((done, tasks.len() - 1)));
+                }
+            }
+        }
+        for data in std::mem::take(&mut self.lib_races) {
+            let Some(&index) = first.get(&Rc::as_ptr(&data)) else {
+                continue;
+            };
+            let winner_task = &tasks[index].0;
+            let winner = winner_task.borrow();
+            let Some(loaded) = data
+                .borrow()
+                .tasks
+                .get(&winner.normalized_file_path)
+                .cloned()
+            else {
+                continue;
+            };
+            if Rc::ptr_eq(&loaded, winner_task) {
+                continue;
+            }
+            let mut loaded = loaded.borrow_mut();
+            if loaded.loaded && loaded.lib_file.is_some() != winner.lib_file.is_some() {
+                loaded.set_lib_file(loader, winner.lib_file.clone());
             }
         }
     }

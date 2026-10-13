@@ -271,6 +271,7 @@ pub fn process_all_program_files(
             task_data_by_path: FxHashMap::default(),
             max_depth: max_node_module_js_depth,
             single_threaded,
+            lib_races: Vec::new(),
         }),
         root_tasks: Vec::with_capacity(
             root_files.len() + compiler_options.lib.as_ref().map_or(0, Vec::len),
@@ -2674,9 +2675,20 @@ mod tests {
     }
 
     /// Writes `files` (path, text) and a tsconfig.json with `tsconfig` to a
-    /// temp dir, loads the program and returns its file names in program
-    /// order: paths relative to the dir, or the base name for a lib file.
+    /// temp dir, loads the program single threaded and returns its file
+    /// names in program order: paths relative to the dir, or the base name
+    /// for a lib file.
     fn program_file_names(label: &str, tsconfig: &str, files: &[(&str, &str)]) -> Vec<String> {
+        program_file_names_in(label, tsconfig, files, true)
+    }
+
+    /// `program_file_names` of a single threaded load or a parallel one.
+    fn program_file_names_in(
+        label: &str,
+        tsconfig: &str,
+        files: &[(&str, &str)],
+        single_threaded: bool,
+    ) -> Vec<String> {
         let dir = std::env::temp_dir().join(format!(
             "ts_goport_file_loader_{label}_{}",
             std::process::id()
@@ -2708,13 +2720,17 @@ mod tests {
                 host,
                 config: Rc::new(config.unwrap()),
                 use_source_of_project_reference: false,
-                single_threaded: Tristate::True,
+                single_threaded: if single_threaded {
+                    Tristate::True
+                } else {
+                    Tristate::False
+                },
                 typings_location: String::new(),
                 project_name: String::new(),
                 create_module_resolver: None,
                 skip_module_resolution: false,
             },
-            true,
+            single_threaded,
         );
         let _ = std::fs::remove_dir_all(&dir);
         let prefix = format!("{cwd}/");
@@ -3409,6 +3425,75 @@ export const a: T | Dep | number = x + (h as never);
             .into_iter()
             .filter(|name| !name.starts_with("lib."))
             .collect()
+    }
+
+    /// bundledpath1: `paths` maps "y" to the bundled `lib.es5.d.ts`, which
+    /// the default lib reaches through 13 lib reference steps. Go's parallel
+    /// load reaches it through the import first, so it is not a lib file and
+    /// comes after the other libs; single threaded, the lib chain loads it
+    /// first. With `lib: ["es2015"]` the lib reference is one step, and Go
+    /// keeps it at its lib place in both modes. The lists are Go's
+    /// `--listFiles` (tsgo-oracle-fed0bf24149f, 20 of 20 runs per mode).
+    #[test]
+    fn a_lib_reached_through_paths_takes_its_place_of_go() {
+        let st = "lib.es5.d.ts lib.es2015.d.ts lib.es2016.d.ts lib.es2017.d.ts \
+            lib.es2018.d.ts lib.es2019.d.ts lib.es2020.d.ts lib.es2021.d.ts lib.es2022.d.ts \
+            lib.es2023.d.ts lib.es2024.d.ts lib.es2025.d.ts lib.es2026.d.ts lib.dom.d.ts \
+            lib.dom.iterable.d.ts lib.dom.asynciterable.d.ts lib.webworker.importscripts.d.ts \
+            lib.scripthost.d.ts lib.es2015.core.d.ts lib.es2015.collection.d.ts \
+            lib.es2015.generator.d.ts lib.es2015.iterable.d.ts lib.es2015.promise.d.ts \
+            lib.es2015.proxy.d.ts lib.es2015.reflect.d.ts lib.es2015.symbol.d.ts \
+            lib.es2015.symbol.wellknown.d.ts lib.es2016.array.include.d.ts lib.es2016.intl.d.ts \
+            lib.es2017.arraybuffer.d.ts lib.es2017.date.d.ts lib.es2017.object.d.ts \
+            lib.es2017.sharedmemory.d.ts lib.es2017.string.d.ts lib.es2017.intl.d.ts \
+            lib.es2017.typedarrays.d.ts lib.es2018.asyncgenerator.d.ts \
+            lib.es2018.asynciterable.d.ts lib.es2018.intl.d.ts lib.es2018.promise.d.ts \
+            lib.es2018.regexp.d.ts lib.es2019.array.d.ts lib.es2019.object.d.ts \
+            lib.es2019.string.d.ts lib.es2019.symbol.d.ts lib.es2019.intl.d.ts \
+            lib.es2020.bigint.d.ts lib.es2020.date.d.ts lib.es2020.promise.d.ts \
+            lib.es2020.sharedmemory.d.ts lib.es2020.string.d.ts lib.es2020.symbol.wellknown.d.ts \
+            lib.es2020.intl.d.ts lib.es2020.number.d.ts lib.es2021.promise.d.ts \
+            lib.es2021.string.d.ts lib.es2021.weakref.d.ts lib.es2021.intl.d.ts \
+            lib.es2022.array.d.ts lib.es2022.error.d.ts lib.es2022.intl.d.ts \
+            lib.es2022.object.d.ts lib.es2022.string.d.ts lib.es2022.regexp.d.ts \
+            lib.es2023.array.d.ts lib.es2023.collection.d.ts lib.es2023.intl.d.ts \
+            lib.es2024.arraybuffer.d.ts lib.es2024.collection.d.ts lib.es2024.object.d.ts \
+            lib.es2024.promise.d.ts lib.es2024.regexp.d.ts lib.es2024.sharedmemory.d.ts \
+            lib.es2024.string.d.ts lib.es2025.collection.d.ts lib.es2025.float16.d.ts \
+            lib.es2025.intl.d.ts lib.es2025.iterator.d.ts lib.es2025.promise.d.ts \
+            lib.es2025.regexp.d.ts lib.es2026.array.d.ts lib.es2026.collection.d.ts \
+            lib.es2026.error.d.ts lib.es2026.iterator.d.ts lib.es2026.json.d.ts \
+            lib.es2026.math.d.ts lib.es2026.typedarrays.d.ts lib.decorators.d.ts \
+            lib.decorators.legacy.d.ts lib.es2026.full.d.ts a.ts";
+        let st: Vec<&str> = st.split_whitespace().collect();
+        // Go's parallel list: lib.es5.d.ts last before a.ts.
+        let mut parallel = st[1..st.len() - 1].to_vec();
+        parallel.extend(["lib.es5.d.ts", "a.ts"]);
+        let es2015 = "lib.es5.d.ts lib.es2015.d.ts lib.es2015.core.d.ts \
+            lib.es2015.collection.d.ts lib.es2015.generator.d.ts lib.es2015.iterable.d.ts \
+            lib.es2015.promise.d.ts lib.es2015.proxy.d.ts lib.es2015.reflect.d.ts \
+            lib.es2015.symbol.d.ts lib.es2015.symbol.wellknown.d.ts lib.decorators.d.ts \
+            lib.decorators.legacy.d.ts a.ts";
+        let es2015: Vec<&str> = es2015.split_whitespace().collect();
+        let files = [("a.ts", "import * as y from \"y\"; export const z = y;\n")];
+        for (lib, single_threaded, expected) in [
+            ("", false, &parallel),
+            ("", true, &st),
+            (r#""lib": ["es2015"], "#, false, &es2015),
+            (r#""lib": ["es2015"], "#, true, &es2015),
+        ] {
+            let tsconfig = format!(
+                r#"{{ "compilerOptions": {{ {lib}"noEmit": true,
+                     "paths": {{ "y": ["bundled:///libs/lib.es5.d.ts"] }} }},
+                     "files": ["a.ts"] }}"#
+            );
+            let label = format!("lib_race_{}_{single_threaded}", lib.len());
+            assert_eq!(
+                program_file_names_in(&label, &tsconfig, &files, single_threaded),
+                *expected,
+                "{lib} single threaded {single_threaded}"
+            );
+        }
     }
 
     // Go `compilerOptions.Lib == nil` loads the default lib. An explicit
