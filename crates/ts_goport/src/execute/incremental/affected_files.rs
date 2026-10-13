@@ -598,7 +598,9 @@ pub fn collect_all_affected_files(program: &Program) {
     // file (affectedfileshandler.go:69), and where its widenings come first
     // sets the d.ts text, so the order counts. Parallel, the goroutines race
     // on each checker as the d.ts parts of `Program.Emit` do, and the port
-    // takes the same order (`dts_order`).
+    // takes the same order (`dts_order`). Single threaded, Go runs each queue
+    // last queued first (core/workgroup.go:67), and the port runs each loop
+    // in reverse (dtsorder1: better-auth/00/incr step 2).
     let changed_files: Vec<Path> = {
         let files: Vec<Node> = changed_files
             .iter()
@@ -637,7 +639,7 @@ pub fn collect_all_affected_files(program: &Program) {
 /// last in the parallel order, as it emits nothing).
 fn signature_order(files: &[Node]) -> Vec<usize> {
     if crate::program::single_threaded() {
-        return (0..files.len()).collect();
+        return (0..files.len()).rev().collect();
     }
     let known: Vec<usize> = (0..files.len()).filter(|&k| !files[k].is_nil()).collect();
     let known_files: Vec<Node> = known.iter().map(|&k| files[k]).collect();
