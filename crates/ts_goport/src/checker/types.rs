@@ -3058,9 +3058,12 @@ mod flat_arena {
         /// Entry `i`, which is past `items`. Panics when it is out of bounds.
         ///
         /// PERF (flatarena1 round 2): inlined on the cold path of the read.
-        /// Out of line, an arena that keeps chunks (no room) took 3% (hono
-        /// st) to 21% (elysia st) more instructions than the chunks of R209,
-        /// inlined 1% to 4.5% (plain builds, flatarena1 r2 knob2).
+        /// With no room (chunks), out of line took 3% (hono st) to 21%
+        /// (elysia st) more instructions than the chunks of R209 and inlined
+        /// up to 4.5% (plain builds, r2 knob2); PGO+BOLT, which never runs
+        /// this path in training, 0.4% to 11.5% (r2 limited). Out of line
+        /// also cost the flat reads more (r2 study: elysia st -7.6% against
+        /// R209, inlined -8.3%, with no `rest` at all -11.7%).
         #[inline(always)]
         fn rest_entry(&self, i: usize) -> &T {
             let j = i - self.items.len();
