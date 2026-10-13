@@ -313,17 +313,6 @@ pub(crate) fn read_data_miss<R>(n: Node, read: impl FnOnce(NodeData<'_>) -> R) -
     crate::ast::synthetic::read_ast_node_miss(n, read)
 }
 
-/// `read()`, out of line and cold: the far path of an inline node field
-/// read, for a node that is not a published store node with node data. Each
-/// closure gets its own copy.
-// PERF: nodeinline1. The list read of such a node (`list_of!`) was inline in
-// each list accessor and kept the accessor too large to inline.
-#[cold]
-#[inline(never)]
-fn cold_read<R>(read: impl FnOnce() -> R) -> R {
-    read()
-}
-
 /// Go field read by node data variant. Each arm lists `NodeData` variants,
 /// binds the variant data to `$d` and the node's file to `$file`, and
 /// evaluates `$e`. Other variants give `$def`.
@@ -443,7 +432,7 @@ macro_rules! frozen_list_of {
                     )
                 })
             }
-            None => cold_read(move || $of!(n__, |$d| $body)),
+            None => $of!(n__, |$d| $body),
         }
     }};
 }
@@ -617,8 +606,6 @@ macro_rules! modifiers_variants {
 /// `by_data!`.
 macro_rules! modifiers_accessor {
     ([$($v:ident),+ $(,)?]) => {
-        // PERF: nodeinline1, as `Node::statement_list`.
-        #[inline]
         #[must_use]
         pub fn modifiers(self) -> ModifierList {
             list_by_data!(self, modifiers_of, ModifierList::NIL, [$($v),+] => mods modifiers)
@@ -944,7 +931,6 @@ macro_rules! type_arguments_arms {
 macro_rules! initializer_data_accessor {
     ($($arms:tt)*) => {
         data_accessor! {
-            #[inline(never)]
             fn initializer_data, initializer_data_in(n) -> Node {
                 Node::NIL,
                 $($arms)*
@@ -1429,7 +1415,6 @@ impl NodeSlice {
     pub const NIL: Self = Self(SliceRepr::Nodes(&[]));
 
     /// A slice over astdata ids in `file`.
-    #[inline]
     #[must_use]
     pub fn from_ids(file: usize, ids: &'static [crate::astdata::NodeId]) -> Self {
         Self(SliceRepr::Ids {
@@ -2035,27 +2020,13 @@ impl NodeList {
     }
 
     /// Go `list.Nodes`. Empty when nil.
-    // PERF: nodeinline1. A static store list and nil are inline; the lists
-    // that are read at each use take the cold `nodes_far`.
-    #[inline]
     #[must_use]
     pub fn nodes(self) -> NodeSlice {
         match self.0 {
             ListRef::Ts { file, list } => NodeSlice::from_ids(file as usize, list.nodes),
             ListRef::Nil => NodeSlice::NIL,
-            ListRef::Store(_) | ListRef::Own { .. } => self.nodes_far(),
-        }
-    }
-
-    /// `nodes` of a list of a store that owns its nodes or of the synthetic
-    /// arena.
-    #[cold]
-    #[inline(never)]
-    fn nodes_far(self) -> NodeSlice {
-        match self.0 {
             ListRef::Store(list) => NodeSlice::from_store(list),
             ListRef::Own { index } => NodeSlice::from_synthetic(SyntheticList::Own { index }),
-            ListRef::Ts { .. } | ListRef::Nil => unreachable!("NodeList::nodes reads these inline"),
         }
     }
 
@@ -2955,9 +2926,6 @@ impl Node {
     // Go: ast.go:265 Body
     // PORT: also covers ClassStaticBlockDeclaration, whose Go `Body` field
     // has no generated accessor.
-    // PERF: nodeinline1 measured `#[inline]` here: the PGO build kept it out
-    // of line at the hot sites (VS Code st self cycles 200 to 192 M), so it
-    // has no hint.
     #[must_use]
     pub fn body(self) -> Node {
         by_child_ids!(
@@ -3143,9 +3111,6 @@ impl Node {
     // Go: ast.go:311 Expression
     // PERF: U4 (CH6). A published store node reads its expression child from
     // the store column (`frozen_store_child`), as `Node::name` does.
-    // PERF: nodeinline1. Only the column read is inline; the node data read
-    // (`expression_data`) is out of line. Go reads a struct field.
-    #[inline]
     #[must_use]
     pub fn expression(self) -> Node {
         match frozen_store_child(self, StoreChild::Expression) {
@@ -3157,11 +3122,7 @@ impl Node {
         }
     }
 
-    /// Go `Expression()` from the node data (`expression_arms!`): a node
-    /// with no known column entry (not a published store node, a
-    /// QualifiedName, a case or default clause).
-    #[cold]
-    #[inline(never)]
+    /// Go `Expression()` from the node data (`expression_arms!`).
     fn expression_data(self) -> Node {
         expression_arms!(
             by_data!(
@@ -3201,24 +3162,17 @@ impl Node {
     }
 
     // Go: ast.go:477 ArgumentList
-    // PERF: nodeinline1. `list_by_data!`, as `Node::statement_list`: one
-    // registry lookup, inline.
-    #[inline]
     #[must_use]
     pub fn argument_list(self) -> NodeList {
-        list_by_data!(
-            self,
-            list_of,
-            NodeList::NIL,
-            [CallExpression] => req arguments,
-            [NewExpression] => opt arguments,
-        )
+        list_of!(self, |d| match d {
+            NodeData::CallExpression(d) => Some(sel_field!(req, d.arguments)),
+            NodeData::NewExpression(d) => Some(sel_field!(opt, d.arguments)),
+            _ => None,
+        })
+        .unwrap_or(NodeList::NIL)
     }
 
     // Go: ast.go:487 Arguments
-    // PERF: nodeinline1. Inline, so the inline list read reaches the
-    // caller (without it the PGO build kept this wrapper out of line).
-    #[inline]
     #[must_use]
     pub fn arguments(self) -> NodeSlice {
         self.argument_list().nodes()
@@ -3320,10 +3274,6 @@ impl Node {
     }
 
     // Go: ast.go:582 StatementList
-    // PERF: nodeinline1. Inline: the published store read of `list_by_data!`
-    // is a kind test, the node data and the list table; the other nodes take
-    // a cold call.
-    #[inline]
     #[must_use]
     pub fn statement_list(self) -> NodeList {
         list_by_data!(
@@ -3335,9 +3285,6 @@ impl Node {
     }
 
     // Go: ast.go:596 Statements
-    // PERF: nodeinline1. Inline, so the inline list read reaches the
-    // caller (without it the PGO build kept this wrapper out of line).
-    #[inline]
     #[must_use]
     pub fn statements(self) -> NodeSlice {
         self.statement_list().nodes()
@@ -3379,9 +3326,6 @@ impl Node {
     // generated accessor.
     // PERF: C2. A published store node reads its type child from the store
     // column (`frozen_store_child`), as `Node::name` does.
-    // PERF: nodeinline1. Only the column read is inline, as in
-    // `Node::expression`.
-    #[inline]
     #[must_use]
     pub fn type_(self) -> Node {
         match frozen_store_child(self, StoreChild::Type) {
@@ -3393,10 +3337,7 @@ impl Node {
         }
     }
 
-    /// Go `Type()` from the node data (`type_arms!`): a node with no known
-    /// column entry.
-    #[cold]
-    #[inline(never)]
+    /// Go `Type()` from the node data (`type_arms!`).
     fn type_data(self) -> Node {
         type_arms!(by_data!(self, Node::NIL,), opt, req)
     }
@@ -3405,10 +3346,6 @@ impl Node {
     // PERF: C2, as `Node::type_`. A node with both a type and an
     // initializer keeps only the type in the column; its initializer reads
     // take the node data.
-    // PERF: nodeinline1. Only the column read is inline. The node data read
-    // is out of line but not cold: a node with a type and an initializer
-    // takes it.
-    #[inline]
     #[must_use]
     pub fn initializer(self) -> Node {
         match frozen_store_child(self, StoreChild::Initializer) {
@@ -3636,8 +3573,6 @@ impl Node {
     }
 
     // Go: ast.go:1028 PropertyList
-    // PERF: nodeinline1, as `Node::statement_list`.
-    #[inline]
     #[must_use]
     pub fn property_list(self) -> NodeList {
         list_by_data!(
@@ -3660,17 +3595,12 @@ impl Node {
     }
 
     // Go: ast.go:1038 Properties
-    // PERF: nodeinline1. Inline, so the inline list read reaches the
-    // caller (without it the PGO build kept this wrapper out of line).
-    #[inline]
     #[must_use]
     pub fn properties(self) -> NodeSlice {
         self.property_list().nodes()
     }
 
     // Go: ast.go:1046 ElementList
-    // PERF: nodeinline1, as `Node::statement_list`.
-    #[inline]
     #[must_use]
     pub fn element_list(self) -> NodeList {
         list_by_data!(
@@ -3688,9 +3618,6 @@ impl Node {
     }
 
     // Go: ast.go:1062 Elements
-    // PERF: nodeinline1. Inline, so the inline list read reaches the
-    // caller (without it the PGO build kept this wrapper out of line).
-    #[inline]
     #[must_use]
     pub fn elements(self) -> NodeSlice {
         self.element_list().nodes()
@@ -6002,7 +5929,6 @@ pub fn is_array_literal_or_object_literal_destructuring_pattern(node: Node) -> b
 }
 
 // Go: ast.go:1430 accessKind
-#[inline]
 fn access_kind(node: Node) -> AccessKind {
     access_kind_ref(NodeRef::new(node))
 }
@@ -6011,35 +5937,12 @@ fn access_kind(node: Node) -> AccessKind {
 // PERF: checkid1. The parent, its kind and the parents of the recursive
 // steps are read through views (`NodeRef`): a parent in the same store
 // costs no registry lookup. Go reads struct fields. Same tests, same order.
-// PERF: nodeinline1. The first step is inline: a nil parent, or a parent
-// of a kind that no arm of `access_kind_of_parent` reads, is a read.
-#[inline]
 fn access_kind_ref(node: NodeRef) -> AccessKind {
     let parent = node.parent();
     if parent.is_nil() {
         return AccessKind::READ;
     }
-    let kind = parent.kind();
-    match kind {
-        SyntaxKind::ParenthesizedExpression
-        | SyntaxKind::ArrayLiteralExpression
-        | SyntaxKind::PrefixUnaryExpression
-        | SyntaxKind::PostfixUnaryExpression
-        | SyntaxKind::BinaryExpression
-        | SyntaxKind::PropertyAccessExpression
-        | SyntaxKind::PropertyAssignment
-        | SyntaxKind::ShorthandPropertyAssignment
-        | SyntaxKind::ForInStatement
-        | SyntaxKind::ForOfStatement => access_kind_of_parent(node, parent, kind),
-        _ => AccessKind::READ,
-    }
-}
-
-/// The arms of `access_kind_ref` for `parent`, the parent of `node`, of
-/// kind `kind`.
-#[inline(never)]
-fn access_kind_of_parent(node: NodeRef, parent: NodeRef, kind: SyntaxKind) -> AccessKind {
-    match kind {
+    match parent.kind() {
         SyntaxKind::ParenthesizedExpression | SyntaxKind::ArrayLiteralExpression => {
             access_kind_ref(parent)
         }
