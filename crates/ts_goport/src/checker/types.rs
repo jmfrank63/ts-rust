@@ -2840,14 +2840,15 @@ pub type StringLiteralType = Type;
 // inference context on its own; the port keeps them in index arenas
 // (`ChunkedArena`). Index 0 is the nil dummy, like the other arenas.
 //
-// PERF (flatarena1, layout1 B2): on 64-bit targets that are not Windows, the
-// arena is flat (`flat_arena`), so a read is the arena base, one bounds check
-// and the entry. With chunks, each read loaded the chunk table and the chunk
-// before the entry (the port issued 1.5 to 1.9x Go's loads on type records).
-// Flat, VS Code st took 5.7% fewer instructions and 2.9% fewer cycles
-// (PGO+BOLT, flatarena1). Windows (its allocator commits a large allocation
-// at once) and 32-bit targets (no room for the reserve) keep the chunks
-// (`chunked_arena`).
+// PERF (flatarena1, layout1 B2): on 64-bit targets that are not Windows,
+// `flat_arena` keeps its first chunk flat, and the type arena of a large
+// program all its entries (a room), so a read there is the arena base, one
+// bounds check and the entry. With chunks, each read loaded the chunk table
+// and the chunk before the entry (the port issued 1.5 to 1.9x Go's loads on
+// type records). Flat, VS Code st took 5.7% fewer instructions and 2.9%
+// fewer cycles (PGO+BOLT, flatarena1 round 1). Windows (its allocator commits
+// a large allocation at once) and 32-bit targets (no room for the reserve)
+// keep `chunked_arena`.
 #[cfg(not(all(target_pointer_width = "64", not(windows))))]
 pub use chunked_arena::ChunkedArena;
 #[cfg(all(target_pointer_width = "64", not(windows)))]
@@ -2858,29 +2859,32 @@ mod flat_arena {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A flat `Vec` (`items`), then chunks (`rest`) when it cannot grow
-    /// without a copy.
+    /// A `Vec` (`items`), then chunks of `CHUNK_LEN` entries (`rest`).
     ///
-    /// PERF (rss2, layout1): `items` starts at `ARENA_FIRST_CAPACITY` entries
-    /// and doubles while it is smaller than `ARENA_SMALL_BYTES`, so a small
-    /// program keeps a small arena (query: about 5,300 `Type`s in each
-    /// checker; jemalloc gives the heap huge pages, which make allocated
-    /// memory resident). Then it moves into a room (`ARENA_ROOMS`). A room
-    /// is virtual memory: jemalloc maps it untouched, only the written
-    /// entries become resident, and the pushes into it do not copy.
+    /// PERF (flatarena1 round 3): `items` is the first chunk of the R208
+    /// chunked arena. It starts at `FIRST_CAPACITY` entries, doubles up to
+    /// `CHUNK_STEP`, then grows in steps of as many up to `CHUNK_LEN`. The
+    /// later entries go into `rest`. When `rest` would get its
+    /// `MOVE_CHUNKS + 1`th chunk, the type arena of a large program moves
+    /// every entry into a room (`planned_room`) and pushes into it from then
+    /// on. A room is virtual memory: jemalloc maps it untouched, only the
+    /// written entries become resident, and the pushes into it do not copy.
+    /// When the room is full, the later entries go into `rest` again. So a
+    /// small or mid-size program keeps the memory of the R208 chunks, and no
+    /// arena copies more than its first `MOVE_CHUNKS + 1` chunks (5 MiB of
+    /// types).
     ///
-    /// When the arena cannot take a room (`take_room`, `try_reserve_exact`)
-    /// or its last room is full, the later entries go into `rest` in chunks of
-    /// `CHUNK_LEN`, as in the chunked arena of R208. A doubling `Vec` would
-    /// hold the old and the new buffer while it copies (flatarena1 round 1,
-    /// st peak RSS: type-fest +11.4%, zod +11.3%, typebox +7.2%). A read of
-    /// `items` makes one test, the bounds check of one `Vec`, and a read of
-    /// `rest` takes the cold path after it (`rest_entry`).
+    /// A read of `items` makes one test, the bounds check of one `Vec`. A
+    /// read of `rest` makes that test, then one bounds check of `rest`: a
+    /// chunk is an array, so its index needs no check (the R208 read made
+    /// two checks, the chunk table and the chunk).
     pub struct ChunkedArena<T> {
         /// Entries `0..items.len()`. Full while `rest` is not empty.
         items: Vec<T>,
-        /// The entries after `items`, `CHUNK_LEN` in each chunk.
-        rest: Vec<Vec<T>>,
+        /// The entries after `items`, `CHUNK_LEN` in each chunk. The slots
+        /// after the last entry hold `T::default()` until a push replaces
+        /// them.
+        rest: Vec<Box<[T; CHUNK_LEN]>>,
         /// The number of entries in `rest`.
         rest_len: usize,
         /// The bytes of the room that `items` is in (counted in
@@ -2888,30 +2892,60 @@ mod flat_arena {
         room_bytes: usize,
     }
 
-    /// The room of the arena when it is made.
-    const ARENA_FIRST_CAPACITY: usize = 64;
-    /// `items` doubles while it is smaller than this.
-    const ARENA_SMALL_BYTES: usize = 2 << 20;
-    /// The rooms that `items` moves into after the small phase, the second
-    /// when it fills the first.
-    ///
-    /// PERF (flatarena1 round 2): the first room holds the arenas of every
-    /// gate project but type-fest st and elysia st (zod st has 530,000
-    /// types, 65 MiB). With system THP `always`, the peak RSS cost of a room
-    /// grows with its size: with a 2 GiB first room hono def took 6.5% and
-    /// zod def 5.0% more than R209, with 256 MiB 2.2% and 1.9% (THP
-    /// `madvise`: 1.8% and 0.7%, then 1.3% and 0.5%; plain builds, r2
-    /// knob2). A first room of 64 MiB is too small for zod st and effect st
-    /// (the copy into the second room: +11.4% and +6.9%), and type-fest st
-    /// copies one of 512 MiB near its peak (+11.4%). An arena that fills the
-    /// first room is copied once into the second.
-    const ARENA_ROOMS: [usize; 2] = [256 << 20, 1 << 31];
-    /// 8,192 entries in each chunk of `rest`, as in `chunked_arena`.
+    /// The capacity of `items` when the arena is made.
+    const FIRST_CAPACITY: usize = 64;
+    /// 8,192 entries in each chunk, as in `chunked_arena`.
     const CHUNK_SHIFT: usize = 13;
     const CHUNK_LEN: usize = 1 << CHUNK_SHIFT;
     const CHUNK_MASK: usize = CHUNK_LEN - 1;
+    /// `items` doubles up to this many entries, then grows by as many.
+    const CHUNK_STEP: usize = CHUNK_LEN / 4;
+    /// The full chunks in `rest` when the arena moves into its room.
+    ///
+    /// PERF (flatarena1 round 3): a room costs a few MiB of peak RSS under
+    /// system THP `always`, used or not. Astro st (1.1 million nodes, 22,000
+    /// types) took 8 MiB (3.3%) more than R210 with a 64 MiB room at the
+    /// first chunk, and 0.8% with the move at 5 chunks (no room; r3 knob2,
+    /// knob3). The 5 MiB that the move frees go back to jemalloc for the
+    /// later allocations.
+    const MOVE_CHUNKS: usize = 4;
+    /// Only an arena whose chunks hold at least this many bytes takes a
+    /// room: the type arena (`Type` is 128 bytes). The mapper (16 bytes) and
+    /// inference context (56 bytes) arenas hold few bytes, and their flat
+    /// reads were 0.4 to 1.1 points of the round 1 instruction gain
+    /// (flatarena1 gate.md).
+    const ROOM_MIN_CHUNK_BYTES: usize = 1 << 20;
+    /// A program with fewer nodes keeps chunks.
+    ///
+    /// PERF (flatarena1 round 3): the program size known before check
+    /// predicts its peak RSS, but not its type count (type-fest makes 13
+    /// types for each node, query 0.04). Of the 54 projects of the round 2
+    /// RSS sweep and the gate projects, those over this size whose type
+    /// arena reaches the move peak at 330 MiB or more (es-toolkit st), so
+    /// a room of a few MiB is about 1% of the peak or less. In round 2 every
+    /// arena past 2 MiB took a room, and mid-size programs rose up to 14.5%
+    /// (ts-essentials def, 67,000 nodes). Rooms for every program would
+    /// take 1.7% fewer instructions on hono st and 1.2% on type-fest st
+    /// (r3 knobins2), and 2.7% more peak RSS on hono st.
+    const ROOM_MIN_NODES: usize = 600_000;
+    /// The room has this many bytes for each node of the program, between
+    /// `ROOM_MIN_BYTES` and `ROOM_MAX_BYTES`.
+    ///
+    /// PERF (flatarena1 round 3): 1.5 to 6 times the type arena of a program
+    /// that is not mostly types (zod st: 68 MiB in a 100 MiB room). Under
+    /// system THP `always` a larger room costs more peak RSS: prettier def
+    /// took 1.3% more than R210 with 64 MiB rooms at the first chunk, 3.0%
+    /// with 512 MiB and 4.5% with 2 GiB (r3 knob1); with 256 bytes a node,
+    /// es-toolkit def 2.8% and with 128 bytes 1.8% (r3 knob3). The larger
+    /// room took 0.5 (elysia st) and 0.9 (typebox st) points more off the
+    /// instructions (r3 knobins2). An arena that fills its room goes on in
+    /// `rest` and is not copied (round 2 copied it into a 2 GiB room:
+    /// typebox st +7.4%).
+    const ROOM_BYTES_PER_NODE: usize = 128;
+    const ROOM_MIN_BYTES: usize = 64 << 20;
+    const ROOM_MAX_BYTES: usize = 1 << 31;
     /// The rooms of a process take at most 1/`LIMIT_SHARE` of an address
-    /// space or data limit, so there is no room below a limit of 32 GiB.
+    /// space or data limit.
     const LIMIT_SHARE: u64 = 128;
 
     /// The bytes of room that the arenas can still take. A room counts in
@@ -2922,7 +2956,7 @@ mod flat_arena {
     /// 8 GiB on zod, effect, typebox, elysia and type-fest, where R208
     /// completes). Under strict overcommit there is no room, and under a
     /// limit the rooms take at most 1/`LIMIT_SHARE` of it. The arenas then
-    /// keep the chunks of R208, as on Windows.
+    /// keep chunks, as on Windows.
     fn room_budget() -> &'static AtomicUsize {
         static BUDGET: OnceLock<AtomicUsize> = OnceLock::new();
         BUDGET.get_or_init(|| {
@@ -2954,10 +2988,48 @@ mod flat_arena {
         }
     }
 
-    impl<T> ChunkedArena<T> {
+    /// The room for an arena of `T` with `MOVE_CHUNKS` full chunks in
+    /// `rest`, or 0 when it keeps chunks. A checker grows its arenas while
+    /// its program is the current one (`core::enter_program`).
+    fn planned_room<T>() -> usize {
+        if size_of::<T>() * CHUNK_LEN < ROOM_MIN_CHUNK_BYTES {
+            return 0;
+        }
+        let nodes = crate::core::try_prog().map_or(0, |program| {
+            program
+                .source_files()
+                .map(|file| file.parser_flags.len())
+                .sum()
+        });
+        room_for_nodes(nodes)
+    }
+
+    /// The room of the type arena of a program of `nodes` nodes, or 0.
+    fn room_for_nodes(nodes: usize) -> usize {
+        if nodes < ROOM_MIN_NODES {
+            return 0;
+        }
+        nodes
+            .saturating_mul(ROOM_BYTES_PER_NODE)
+            .clamp(ROOM_MIN_BYTES, ROOM_MAX_BYTES)
+    }
+
+    /// A chunk of `CHUNK_LEN` default entries. Pushes replace them in
+    /// order.
+    #[cold]
+    #[inline(never)]
+    fn new_chunk<T: Default>() -> Box<[T; CHUNK_LEN]> {
+        let entries: Box<[T]> = std::iter::repeat_with(T::default).take(CHUNK_LEN).collect();
+        match entries.try_into() {
+            Ok(chunk) => chunk,
+            Err(_) => unreachable!("a chunk has CHUNK_LEN entries"),
+        }
+    }
+
+    impl<T: Default> ChunkedArena<T> {
         /// Creates an arena that holds only `nil`, the dummy entry at index 0.
         pub fn with_nil(nil: T) -> Self {
-            let mut items = Vec::with_capacity(ARENA_FIRST_CAPACITY);
+            let mut items = Vec::with_capacity(FIRST_CAPACITY);
             items.push(nil);
             ChunkedArena {
                 items,
@@ -2983,7 +3055,14 @@ mod flat_arena {
         }
 
         /// Pushes the value `make` returns. `make` runs after the room
-        /// tests, so a large value (a `Type`) is built straight in its slot.
+        /// tests, so a large value (a `Type`) is built straight in its slot
+        /// of `items`.
+        #[inline(always)]
+        pub fn push_with(&mut self, make: impl FnOnce() -> T) {
+            self.push_planned(make, planned_room::<T>);
+        }
+
+        /// `push_with` with `room` as `planned_room`.
         ///
         /// PERF (flatarena1): with one test, the grow branch of `Vec::push`
         /// stayed after `grow`, so `make` built each `Type` on the stack and
@@ -2992,11 +3071,12 @@ mod flat_arena {
         /// gives no room, the entry goes to `rest`), and with it LLVM knows
         /// there is room at the push: when `make` makes no call, the grow
         /// branch of `Vec::push` goes. When the first test fails, the second
-        /// is known to fail too, so the hot path makes one test.
+        /// is known to fail too, so the hot path makes one test. Once `rest`
+        /// has entries, a push goes there without `grow`.
         #[inline(always)]
-        pub fn push_with(&mut self, make: impl FnOnce() -> T) {
-            if self.items.len() == self.items.capacity() && !self.grow() {
-                self.push_rest(make());
+        fn push_planned(&mut self, make: impl FnOnce() -> T, room: fn() -> usize) {
+            if self.items.len() == self.items.capacity() && (self.rest_len > 0 || !self.grow()) {
+                self.push_rest(make(), room);
                 return;
             }
             if self.items.len() == self.items.capacity() {
@@ -3005,65 +3085,74 @@ mod flat_arena {
             self.items.push(make());
         }
 
+        /// Grows the full first chunk in `items`. False when it has
+        /// `CHUNK_LEN` entries, or `items` is a full room, and the entry goes
+        /// to `rest`.
         #[cold]
         #[inline(never)]
         fn grow(&mut self) -> bool {
-            self.grow_with(take_room)
-        }
-
-        /// Gives the full `items` room for more entries: it doubles in the
-        /// small phase, then moves into the next room of `ARENA_ROOMS` when
-        /// `take_room` gives it. False when `items` stays full and the entry
-        /// goes to `rest`.
-        fn grow_with(&mut self, take_room: fn(usize) -> bool) -> bool {
-            if !self.rest.is_empty() {
-                return false;
-            }
-            let size = size_of::<T>().max(1);
             let cap = self.items.capacity();
-            if cap * size < ARENA_SMALL_BYTES {
-                self.items.reserve_exact(cap);
-                return true;
-            }
-            let Some(&bytes) = ARENA_ROOMS.iter().find(|&&bytes| bytes / size > cap) else {
-                return false;
-            };
-            if !take_room(bytes) {
+            if cap >= CHUNK_LEN {
                 return false;
             }
-            if self.items.try_reserve_exact(bytes / size - cap).is_err() {
-                give_room_back(bytes);
-                return false;
-            }
-            give_room_back(self.room_bytes);
-            self.room_bytes = bytes;
+            self.items.reserve_exact(cap.min(CHUNK_STEP));
             true
         }
 
-        /// Pushes `value` at the end of `rest`.
-        #[cold]
+        /// Pushes `value` at the end of `rest`, or into the room that `room`
+        /// plans when the arena moves there (`move_into_room`).
         #[inline(never)]
-        fn push_rest(&mut self, value: T) {
-            match self.rest.last_mut() {
-                Some(chunk) if chunk.len() < CHUNK_LEN => chunk.push(value),
-                _ => {
-                    let mut chunk = Vec::with_capacity(CHUNK_LEN);
-                    chunk.push(value);
-                    self.rest.push(chunk);
+        fn push_rest(&mut self, value: T, room: fn() -> usize) {
+            let slot = self.rest_len & CHUNK_MASK;
+            if slot == 0 {
+                if self.rest.len() == MOVE_CHUNKS && self.move_into_room(room) {
+                    self.items.push(value);
+                    return;
                 }
+                self.rest.push(new_chunk());
             }
+            let chunk = self.rest.last_mut().expect("arena chunk");
+            chunk[slot] = value;
             self.rest_len += 1;
         }
 
-        /// Entry `i`, which is past `items`. Panics when it is out of bounds.
-        ///
-        /// PERF (flatarena1 round 2): inlined on the cold path of the read.
-        /// With no room (chunks), out of line took 3% (hono st) to 21%
-        /// (elysia st) more instructions than the chunks of R209 and inlined
-        /// up to 4.5% (plain builds, r2 knob2); PGO+BOLT, which never runs
-        /// this path in training, 0.4% to 11.5% (r2 limited). Out of line
-        /// also cost the flat reads more (r2 study: elysia st -7.6% against
-        /// R209, inlined -8.3%, with no `rest` at all -11.7%).
+        /// Moves every entry into the room that `room` plans when
+        /// `take_room` gives it, with space for more. False when the arena
+        /// keeps its chunks.
+        #[cold]
+        #[inline(never)]
+        fn move_into_room(&mut self, room: fn() -> usize) -> bool {
+            if self.room_bytes > 0 {
+                return false;
+            }
+            let cap = self.len() + 1;
+            let bytes = room();
+            if bytes / size_of::<T>().max(1) <= cap || !take_room(bytes) {
+                return false;
+            }
+            let room_cap = bytes / size_of::<T>().max(1);
+            if self
+                .items
+                .try_reserve_exact(room_cap - self.items.len())
+                .is_err()
+            {
+                give_room_back(bytes);
+                return false;
+            }
+            for chunk in self.rest.drain(..) {
+                let chunk: Box<[T]> = chunk;
+                self.items.append(&mut chunk.into_vec());
+            }
+            self.rest_len = 0;
+            self.room_bytes = bytes;
+            true
+        }
+    }
+
+    impl<T> ChunkedArena<T> {
+        /// Entry `i`, which is past `items`. An index past the last entry
+        /// but in its chunk gives a default entry; one past that chunk
+        /// panics.
         #[inline(always)]
         fn rest_entry(&self, i: usize) -> &T {
             let j = i - self.items.len();
@@ -3083,13 +3172,17 @@ mod flat_arena {
         }
     }
 
-    /// `items` has no room after `grow`. `push_with` never gets here.
+    /// `items` has no room after `grow`. `push_planned` never gets here.
     #[cold]
     #[inline(never)]
     fn arena_full() -> ! {
         panic!("arena is full")
     }
 
+    // PERF (flatarena1 round 3): no cold hint on the `rest` read. In a
+    // program that keeps chunks, most reads go there; the PGO training runs
+    // both (hono keeps chunks, zod and effect take a room, elysia fills its
+    // room).
     impl<T> std::ops::Index<usize> for ChunkedArena<T> {
         type Output = T;
 
@@ -3098,7 +3191,6 @@ mod flat_arena {
             if i < self.items.len() {
                 &self.items[i]
             } else {
-                std::hint::cold_path();
                 self.rest_entry(i)
             }
         }
@@ -3110,7 +3202,6 @@ mod flat_arena {
             if i < self.items.len() {
                 &mut self.items[i]
             } else {
-                std::hint::cold_path();
                 self.rest_entry_mut(i)
             }
         }
@@ -3120,36 +3211,44 @@ mod flat_arena {
     mod tests {
         use super::*;
 
-        // The entries keep their indexes through the small phase, the move
-        // into the room, and the chunks after a small phase with no room.
+        // The entries keep their indexes through the first chunk, the
+        // chunks, the move into a room that then fills, and the chunks
+        // after it; and with no room, through the first chunk and the
+        // chunks.
         #[test]
         fn flat_arena_keeps_entries_when_it_grows() {
-            fn no_room(_: usize) -> bool {
-                false
-            }
-            for may_take_room in [take_room as fn(usize) -> bool, no_room] {
+            const N: usize = 100_000;
+            let rooms: [fn() -> usize; 2] = [|| 0, || 8 * CHUNK_LEN * size_of::<u64>()];
+            for room in rooms {
                 let mut arena = ChunkedArena::with_nil(0u64);
-                for i in 1..300_000u64 {
-                    if arena.items.len() == arena.items.capacity()
-                        && !arena.grow_with(may_take_room)
-                    {
-                        arena.push_rest(i);
-                    } else {
-                        arena.items.push(i);
-                    }
+                for i in 1..N as u64 {
+                    arena.push_planned(|| i, room);
                 }
-                assert_eq!(arena.len(), 300_000);
-                assert!((0..300_000).all(|i| arena[i] == i as u64));
-                arena[299_999] = 7;
-                assert_eq!(arena[299_999], 7);
-                let small = ARENA_SMALL_BYTES / 8;
-                if arena.room_bytes > 0 {
-                    assert_eq!(arena.items.capacity(), ARENA_ROOMS[0] / 8);
+                assert_eq!(arena.len(), N);
+                assert!((0..N).all(|i| arena[i] == i as u64));
+                arena[N - 1] = 7;
+                assert_eq!(arena[N - 1], 7);
+                // A room when the budget gave it (no room under strict
+                // overcommit).
+                let flat = if arena.room_bytes > 0 {
+                    8 * CHUNK_LEN
                 } else {
-                    assert_eq!(arena.items.len(), small);
-                    assert_eq!(arena.rest_len, 300_000 - small);
-                }
+                    CHUNK_LEN
+                };
+                assert_eq!(arena.items.len(), flat);
+                assert_eq!(arena.rest_len, N - flat);
             }
+        }
+
+        #[test]
+        fn rooms_only_for_large_programs() {
+            assert_eq!(room_for_nodes(ROOM_MIN_NODES - 1), 0);
+            assert_eq!(
+                room_for_nodes(ROOM_MIN_NODES),
+                ROOM_MIN_NODES * ROOM_BYTES_PER_NODE
+            );
+            assert_eq!(room_for_nodes(usize::MAX), ROOM_MAX_BYTES);
+            assert_eq!(planned_room::<u64>(), 0);
         }
     }
 }

@@ -168,16 +168,21 @@ variant that embeds `X` (panic otherwise). Every other Go method on `*Type`
 - `type_predicates: Vec<TypePredicate>` -> `self.pred(p)`, `self.pred_mut(p)`.
 - `mappers: ChunkedArena<TypeMapper>` -> `self.mapper(m)`, `self.mapper_mut(m)`.
 - `inference_contexts: ChunkedArena<InferenceContext>` -> `self.inference_context(c)`, `self.inference_context_mut(c)`.
-A `ChunkedArena` (`checker/types.rs`) is one flat `Vec` on 64-bit targets
-that are not Windows (flatarena1), so a read is the base, one bounds check
-and the entry. It doubles up to 2 MiB, then moves into a 256 MiB virtual
-room, and into a 2 GiB room when it fills that one, so it does not copy
-every entry when it grows, as a doubling `Vec` does (infermem1: the
-`inference_contexts` `Vec` kept buffers of 512 and 256 MiB on typebox).
-Under strict overcommit or an address space or data limit below 32 GiB it
-takes no room. Then, and when a room fails or the last one is full, the
-later entries go into chunks of 8,192 (a read of them takes a cold path).
-Windows and 32-bit targets keep chunks of 8,192 entries.
+A `ChunkedArena` (`checker/types.rs`, `flat_arena`) on 64-bit targets
+that are not Windows (flatarena1) keeps its first 8,192 entries in a flat
+`Vec` that grows as the R208 first chunk, then chunks of 8,192 entries,
+each an array. A read in the `Vec` is the base, one bounds check and the
+entry; a read in a chunk adds one bounds check of the chunk table. The type
+arena of a program of 600,000 nodes or more moves into a virtual room when
+it has 5 chunks (40,960 types): 128 bytes for each program node, 64 MiB to
+2 GiB. jemalloc maps the room untouched, so only the written entries are
+resident, and the pushes into it do not copy. When the room is full, the
+later entries go into chunks again. An arena copies at most its first 5
+chunks, not every entry as a doubling `Vec` does (infermem1: the
+`inference_contexts` `Vec` kept buffers of 512 and 256 MiB on typebox). Under strict overcommit there is
+no room, and under an address space or data limit the rooms take at most
+1/128 of it. Windows and 32-bit targets keep the R208 chunks
+(`chunked_arena`).
 Each arena has a dummy entry at index 0. New entries are pushed; ids are
 `TypeId(len as u32)` etc. Go `c.newType`, `c.newSignature`,
 `newIndexInfo`, `newTypePredicate`, mapper constructors push into these.
