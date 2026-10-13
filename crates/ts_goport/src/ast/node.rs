@@ -2955,10 +2955,9 @@ impl Node {
     // Go: ast.go:265 Body
     // PORT: also covers ClassStaticBlockDeclaration, whose Go `Body` field
     // has no generated accessor.
-    // PERF: nodeinline1. Inline: the published store read of
-    // `by_child_ids!` (a kind test, the node data, the child id); the other
-    // nodes take the cold `read_ast_node_miss`.
-    #[inline]
+    // PERF: nodeinline1 measured `#[inline]` here: the PGO build kept it out
+    // of line at the hot sites (VS Code st self cycles 200 to 192 M), so it
+    // has no hint.
     #[must_use]
     pub fn body(self) -> Node {
         by_child_ids!(
@@ -3217,6 +3216,9 @@ impl Node {
     }
 
     // Go: ast.go:487 Arguments
+    // PERF: nodeinline1. Inline, so the inline list read reaches the
+    // caller (without it the PGO build kept this wrapper out of line).
+    #[inline]
     #[must_use]
     pub fn arguments(self) -> NodeSlice {
         self.argument_list().nodes()
@@ -3333,6 +3335,9 @@ impl Node {
     }
 
     // Go: ast.go:596 Statements
+    // PERF: nodeinline1. Inline, so the inline list read reaches the
+    // caller (without it the PGO build kept this wrapper out of line).
+    #[inline]
     #[must_use]
     pub fn statements(self) -> NodeSlice {
         self.statement_list().nodes()
@@ -3655,6 +3660,9 @@ impl Node {
     }
 
     // Go: ast.go:1038 Properties
+    // PERF: nodeinline1. Inline, so the inline list read reaches the
+    // caller (without it the PGO build kept this wrapper out of line).
+    #[inline]
     #[must_use]
     pub fn properties(self) -> NodeSlice {
         self.property_list().nodes()
@@ -3680,6 +3688,9 @@ impl Node {
     }
 
     // Go: ast.go:1062 Elements
+    // PERF: nodeinline1. Inline, so the inline list read reaches the
+    // caller (without it the PGO build kept this wrapper out of line).
+    #[inline]
     #[must_use]
     pub fn elements(self) -> NodeSlice {
         self.element_list().nodes()
