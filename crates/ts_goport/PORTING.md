@@ -170,9 +170,10 @@ variant that embeds `X` (panic otherwise). Every other Go method on `*Type`
 - `inference_contexts: ChunkedArena<InferenceContext>` -> `self.inference_context(c)`, `self.inference_context_mut(c)`.
 A `ChunkedArena` (`checker/types.rs`, `flat_arena`) on 64-bit targets
 that are not Windows (flatarena1) keeps its first 8,192 entries in a flat
-`Vec` that grows as the R208 first chunk, then chunks of 8,192 entries,
-each an array. A read in the `Vec` is the base, one bounds check and the
-entry; a read in a chunk adds one bounds check of the chunk table. The type
+`Vec` that grows as the R208 first chunk. When that is full, it becomes the
+first of the chunks of 8,192 entries, each an array (no copy). A read in
+the `Vec` is the base, one bounds check and the entry; a read in a chunk
+adds one bounds check of the chunk table. The type
 arena of a program of 600,000 nodes or more moves into a virtual room when
 it has 5 chunks (40,960 types): 128 bytes for each program node, 64 MiB to
 2 GiB. jemalloc maps the room untouched, so only the written entries are
