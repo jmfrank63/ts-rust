@@ -1911,6 +1911,54 @@ pub fn available_cores() -> usize {
     crate::gostd::runtime::gomaxprocs()
 }
 
+/// Starts a scoped thread named `name` that runs `f`, for port-only work
+/// that the calling thread can do itself (not work Go runs on goroutines:
+/// use `GoThread` for that). `None` when the OS refuses the thread: the
+/// caller then does the work, and the result is the same.
+// PORT: not in Go. The same fallback as the resolve and config prefetch
+// workers (followups58: the serialgap1 threads). It is in goport_core, not
+// beside `GoThread` in goport_util, so that its test hook is `cfg(test)`:
+// its callers and their tests are all in this crate (followups60).
+pub(crate) fn helper_thread<'scope, 'env, F, T>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    name: &str,
+    f: F,
+) -> Option<std::thread::ScopedJoinHandle<'scope, T>>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    #[cfg(test)]
+    if REFUSE_HELPER_THREADS.get() {
+        return None;
+    }
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn_scoped(scope, f)
+        .ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// While set, `helper_thread` on this thread starts no thread
+    /// (`refuse_helper_threads`).
+    static REFUSE_HELPER_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` as if the OS refused every `helper_thread` that this thread
+/// starts, so a test reaches the fallback.
+#[cfg(test)]
+pub(crate) fn refuse_helper_threads<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REFUSE_HELPER_THREADS.set(self.0);
+        }
+    }
+    let _restore = Restore(REFUSE_HELPER_THREADS.replace(true));
+    f()
+}
+
 /// From this many physical cores on (`wide_cores`), a large program load
 /// of a one-program process parses and binds on this many threads
 /// (`ThreadBudget::one_program`).
@@ -2186,7 +2234,9 @@ struct BindQueueState {
     /// The bind threads whose binds have not failed: they take the files
     /// that are left. It counts the threads that `spawn_bind_chain` did not
     /// start. That is right: a thread is left out only when no file is left
-    /// or the bind stopped, and then no thread reads the count.
+    /// or the bind stopped, and then no thread reads the count. A thread
+    /// that panics before it binds takes itself and the threads it would
+    /// start out of the count (`UnstartedBinders`).
     binders: usize,
     /// Set by the loading thread when it stops at a failed file.
     stop: bool,
@@ -2488,12 +2538,39 @@ fn spawn_bind_chain<'scope, F>(
 {
     let seed = WorkerSeed::take_unbuilt();
     spawn_bind_thread(scope, move || {
+        let mut unstarted = UnstartedBinders {
+            queue,
+            count: threads,
+        };
         seed.install();
         if threads > 1 && queue.files_left() {
             spawn_bind_chain(scope, threads - 1, run, queue, sender.clone());
         }
+        unstarted.count = 0;
         run(sender);
     });
+}
+
+/// The bind threads of a chain link that panicked before `run`: the link
+/// and the links that it did not start. On drop it takes them out of
+/// `BindQueueState::binders`, so a thread that waits for the files they
+/// would bind does not wait forever (the scope then joins and raises the
+/// panic). 0 once the link runs.
+// Not in Go: Go binds each file on its own goroutine.
+struct UnstartedBinders<'a> {
+    queue: &'a BindQueue,
+    count: usize,
+}
+
+impl Drop for UnstartedBinders<'_> {
+    fn drop(&mut self) {
+        if self.count > 0 {
+            let mut state = self.queue.lock();
+            state.binders = state.binders.saturating_sub(self.count);
+            drop(state);
+            self.queue.changed.notify_all();
+        }
+    }
 }
 
 /// Starts bind thread `f` in `scope`, with the Go stack size.
