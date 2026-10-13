@@ -931,6 +931,7 @@ macro_rules! type_arguments_arms {
 macro_rules! initializer_data_accessor {
     ($($arms:tt)*) => {
         data_accessor! {
+            #[inline(never)]
             fn initializer_data, initializer_data_in(n) -> Node {
                 Node::NIL,
                 $($arms)*
@@ -2950,8 +2951,24 @@ impl Node {
     // Go: ast.go:261 Text
     // PORT: also covers JsxText, whose Go `Text` field has no generated
     // accessor. Other kinds give "" instead of a panic.
+    // PERF: nodeinline1. A published store Identifier or PrivateIdentifier,
+    // most reads, gives the name of its slot (`frozen_store_text_name`, the
+    // `text_name` read) inline, with no node data read. Other nodes take
+    // `text_far`. Go reads the `Text` field.
+    #[inline]
     #[must_use]
     pub fn text(self) -> &'static str {
+        if let Some(name) = frozen_store_text_name(self) {
+            debug_assert_eq!(name.as_str(), self.text_far(), "nodeinline1 name text");
+            return name.as_str();
+        }
+        self.text_far()
+    }
+
+    /// `text` from the node data: any node but a published store
+    /// Identifier or PrivateIdentifier.
+    #[inline(never)]
+    fn text_far(self) -> &'static str {
         let Some(data) = static_ast_node(self) else {
             return self.scoped_node_text();
         };
@@ -3095,6 +3112,9 @@ impl Node {
     // Go: ast.go:311 Expression
     // PERF: U4 (CH6). A published store node reads its expression child from
     // the store column (`frozen_store_child`), as `Node::name` does.
+    // PERF: nodeinline1. Only the column read is inline; the node data read
+    // (`expression_data`) is out of line. Go reads a struct field.
+    #[inline]
     #[must_use]
     pub fn expression(self) -> Node {
         match frozen_store_child(self, StoreChild::Expression) {
@@ -3106,7 +3126,11 @@ impl Node {
         }
     }
 
-    /// Go `Expression()` from the node data (`expression_arms!`).
+    /// Go `Expression()` from the node data (`expression_arms!`): a node
+    /// with no known column entry (not a published store node, a
+    /// QualifiedName, a case or default clause).
+    #[cold]
+    #[inline(never)]
     fn expression_data(self) -> Node {
         expression_arms!(
             by_data!(
@@ -3310,6 +3334,9 @@ impl Node {
     // generated accessor.
     // PERF: C2. A published store node reads its type child from the store
     // column (`frozen_store_child`), as `Node::name` does.
+    // PERF: nodeinline1. Only the column read is inline, as in
+    // `Node::expression`.
+    #[inline]
     #[must_use]
     pub fn type_(self) -> Node {
         match frozen_store_child(self, StoreChild::Type) {
@@ -3321,7 +3348,10 @@ impl Node {
         }
     }
 
-    /// Go `Type()` from the node data (`type_arms!`).
+    /// Go `Type()` from the node data (`type_arms!`): a node with no known
+    /// column entry.
+    #[cold]
+    #[inline(never)]
     fn type_data(self) -> Node {
         type_arms!(by_data!(self, Node::NIL,), opt, req)
     }
@@ -3330,6 +3360,10 @@ impl Node {
     // PERF: C2, as `Node::type_`. A node with both a type and an
     // initializer keeps only the type in the column; its initializer reads
     // take the node data.
+    // PERF: nodeinline1. Only the column read is inline. The node data read
+    // is out of line but not cold: a node with a type and an initializer
+    // takes it.
+    #[inline]
     #[must_use]
     pub fn initializer(self) -> Node {
         match frozen_store_child(self, StoreChild::Initializer) {
