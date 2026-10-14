@@ -2950,8 +2950,24 @@ impl Node {
     // Go: ast.go:261 Text
     // PORT: also covers JsxText, whose Go `Text` field has no generated
     // accessor. Other kinds give "" instead of a panic.
+    // PERF: nodeinline1. A published store Identifier or PrivateIdentifier,
+    // most reads, gives the name of its slot (`frozen_store_text_name`, the
+    // `text_name` read) inline, with no node data read. Other nodes take
+    // `text_far`. Go reads the `Text` field.
+    #[inline]
     #[must_use]
     pub fn text(self) -> &'static str {
+        if let Some(name) = frozen_store_text_name(self) {
+            debug_assert_eq!(name.as_str(), self.text_far(), "nodeinline1 name text");
+            return name.as_str();
+        }
+        self.text_far()
+    }
+
+    /// `text` from the node data: any node but a published store
+    /// Identifier or PrivateIdentifier.
+    #[inline(never)]
+    fn text_far(self) -> &'static str {
         let Some(data) = static_ast_node(self) else {
             return self.scoped_node_text();
         };
