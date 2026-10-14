@@ -1331,8 +1331,22 @@ pub fn is_module_with_string_literal_name(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:1738 GetContainingClass
+// PERF: propaccess2. Go `FindAncestor(node.Parent, IsClassLike)` reads the
+// kind and the parent of each node as struct fields. The walk reads them
+// through views (`NodeRef`): a parent in the same store costs no registry
+// lookup, and each kind is read once. Same nodes, same order.
 pub fn get_containing_class(node: Node) -> Node {
-    find_ancestor(node.parent(), is_class_like)
+    let mut node = NodeRef::new(node).parent();
+    while node.is_some() {
+        if matches!(
+            node.kind(),
+            SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression
+        ) {
+            return node.node();
+        }
+        node = node.parent();
+    }
+    Node::NIL
 }
 
 // Go: ast/utilities.go:1742 GetExtendsHeritageClauseElements

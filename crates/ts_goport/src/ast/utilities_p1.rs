@@ -1345,8 +1345,13 @@ pub fn is_function_or_source_file(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:531 IsClassLike
+// PERF: propaccess2. One kind read: each `Node::kind` is a registry lookup
+// that LLVM does not merge (`NodeRef`), and Go loads the field.
 pub fn is_class_like(node: Node) -> bool {
-    node.kind() == SyntaxKind::ClassDeclaration || node.kind() == SyntaxKind::ClassExpression
+    matches!(
+        node.kind(),
+        SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression
+    )
 }
 
 // Go: ast/utilities.go:535 IsClassOrInterfaceLike
