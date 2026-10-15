@@ -82,10 +82,16 @@ pub fn is_enabled() -> bool {
 /// call once. The caller runs the compile with no extra scope, like the
 /// installed program.
 pub(crate) fn install_program_version(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) {
-    let np = crate::execute::execute_tsc::new_frontend_program(host, config);
+    let np = {
+        let _c1 = crate::timing::Span::new("C1_new_frontend_program");
+        crate::execute::execute_tsc::new_frontend_program(host, config)
+    };
     crate::program::mark_freeable_parses(&np);
     let previous = CURRENT.with(|current| current.get());
-    let version = crate::program::new_program_version(&np, previous);
+    let version = {
+        let _c2 = crate::timing::Span::new("C2_new_program_version");
+        crate::program::new_program_version(&np, previous)
+    };
     drop(np);
     crate::core::set_thread_program(Some(version));
     CURRENT.with(|current| current.set(Some(version)));
@@ -171,9 +177,16 @@ impl CompilerHost for MultiRunHost {
             .stat(&opts.file_name)
             .map(|info| info.mod_time());
         if let Some(file) = self.cached(&opts.path, m_time, opts) {
+            crate::timing::CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Some(file);
         }
+        crate::timing::CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let started = std::time::Instant::now();
         let file = self.inner.get_source_file(opts)?;
+        crate::timing::CACHE_PARSE_US.fetch_add(
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some(m_time) = m_time {
             PARSE_CACHE.with(|cache| {
                 cache.borrow_mut().insert(
