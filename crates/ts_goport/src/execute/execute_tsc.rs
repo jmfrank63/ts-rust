@@ -758,22 +758,18 @@ fn perform_compilation(
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
     let sys: &dyn System = &**sys_rc;
-    let _b = crate::timing::Span::new("B_perform_compilation");
     start_lib_prefetch(sys, &config, testing.is_some(), true);
     let content_mapper_host = new_content_mapper_host(ctx, sys_rc, config.compiler_options());
     let content_mapper_project = get_content_mapper_project(content_mapper_host.as_ref(), &config);
     let _close_content_mapper_project = CloseContentMapperProject(content_mapper_project.clone());
-    let host = {
-        let _b1 = crate::timing::Span::new("B1_host_setup");
-        new_cached_fs_compiler_host(
-            &sys.get_current_directory(),
-            sys.fs(),
-            &sys.default_library_path(),
-            Some(extended_config_cache as Rc<dyn ExtendedConfigCache>),
-            Some(get_trace_from_sys(sys, config.locale(), testing.clone())),
-            content_mapper_project,
-        )
-    };
+    let host = new_cached_fs_compiler_host(
+        &sys.get_current_directory(),
+        sys.fs(),
+        &sys.default_library_path(),
+        Some(extended_config_cache as Rc<dyn ExtendedConfigCache>),
+        Some(get_trace_from_sys(sys, config.locale(), testing.clone())),
+        content_mapper_project,
+    );
     // PORT: in the multi-run flow, the host of the run sits over the parse
     // cache of the process (`program::multirun`), so a run reuses the
     // parses of the files that an earlier run saw with the same mtime.
@@ -783,10 +779,7 @@ fn perform_compilation(
     start_tracing_if_needed(sys, &config, testing.is_some());
 
     let parse_start = sys.now();
-    {
-        let _c = crate::timing::Span::new("C_install_program");
-        install_program(host, config.clone());
-    }
+    install_program(host, config.clone());
     compile_times.borrow_mut().parse_time = since(sys, parse_start);
     if let Some(content_mapper_host) = &content_mapper_host {
         compile_times.borrow_mut().content_mapper_times = content_mapper_host.timings();
@@ -796,21 +789,18 @@ fn perform_compilation(
         stop_tracing(sys);
         return result(status);
     }
-    let (emit_result, _) = {
-        let _d = crate::timing::Span::new("D_check_emit");
-        emit_and_report_statistics(&EmitInput {
-            sys,
-            program_like: hooks.program_like().unwrap_or(&CompilerProgram),
-            config: Some(&*config),
-            report_diagnostic,
-            report_error_summary,
-            writer: sys.writer(),
-            write_file: hooks.write_file(),
-            compile_times,
-            testing,
-            testing_m_times_cache: None,
-        })
-    };
+    let (emit_result, _) = emit_and_report_statistics(&EmitInput {
+        sys,
+        program_like: hooks.program_like().unwrap_or(&CompilerProgram),
+        config: Some(&*config),
+        report_diagnostic,
+        report_error_summary,
+        writer: sys.writer(),
+        write_file: hooks.write_file(),
+        compile_times,
+        testing,
+        testing_m_times_cache: None,
+    });
 
     stop_tracing(sys);
 

@@ -68,8 +68,6 @@ pub mod scanner_util;
 pub mod sourcemap;
 pub mod spanmap;
 pub mod thp_guard;
-/// TEMPORARY phase-9 spike instrumentation (removed before shipping).
-pub mod timing;
 pub mod tracing;
 pub mod transformers;
 pub mod transpile;

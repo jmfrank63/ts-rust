@@ -82,10 +82,7 @@ pub fn is_enabled() -> bool {
 /// call once. The caller runs the compile with no extra scope, like the
 /// installed program.
 pub(crate) fn install_program_version(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) {
-    let np = {
-        let _c1 = crate::timing::Span::new("C1_new_frontend_program");
-        crate::execute::execute_tsc::new_frontend_program(host, config)
-    };
+    let np = crate::execute::execute_tsc::new_frontend_program(host, config);
     crate::program::mark_freeable_parses(&np);
     let previous = CURRENT.with(|current| current.get());
     // The semantic-diagnostic reuse set of this run, from `np` and the cache
@@ -93,10 +90,7 @@ pub(crate) fn install_program_version(host: Rc<dyn CompilerHost>, config: Rc<Par
     // interned copy `build_program` leaks, so runs with the same options
     // share it.
     prepare_semantic_reuse(&np, super::intern_compiler_options(np.options()));
-    let version = {
-        let _c2 = crate::timing::Span::new("C2_new_program_version");
-        crate::program::new_program_version(&np, previous)
-    };
+    let version = crate::program::new_program_version(&np, previous);
     drop(np);
     crate::core::set_thread_program(Some(version));
     CURRENT.with(|current| current.set(Some(version)));
@@ -182,16 +176,9 @@ impl CompilerHost for MultiRunHost {
             .stat(&opts.file_name)
             .map(|info| info.mod_time());
         if let Some(file) = self.cached(&opts.path, m_time, opts) {
-            crate::timing::CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Some(file);
         }
-        crate::timing::CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let started = std::time::Instant::now();
         let file = self.inner.get_source_file(opts)?;
-        crate::timing::CACHE_PARSE_US.fetch_add(
-            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Relaxed,
-        );
         if let Some(m_time) = m_time {
             PARSE_CACHE.with(|cache| {
                 cache.borrow_mut().insert(
@@ -463,10 +450,6 @@ fn prepare_semantic_reuse(
             // Rule 1: the path set changed.
             let same_set = cache.by_path.len() == files.len()
                 && files.iter().all(|f| cache.by_path.contains_key(f.path()));
-            crate::timing::CACHE_PATHS.store(
-                u64::try_from(cache.by_path.len()).unwrap_or(u64::MAX),
-                std::sync::atomic::Ordering::Relaxed,
-            );
             if !same_set {
                 cache.by_path.clear();
                 return;
@@ -513,10 +496,6 @@ fn prepare_semantic_reuse(
             // Rule 3: keep the files outside the influence of the changed
             // ones that carry no triple-slash references.
             let influenced = influenced_by(np, &changed);
-            crate::timing::CHANGED_FILES.store(
-                u64::try_from(changed.len()).unwrap_or(u64::MAX),
-                std::sync::atomic::Ordering::Relaxed,
-            );
             for file in files {
                 if changed.contains_key(file.path()) || influenced.contains(file.path()) {
                     continue;
@@ -559,14 +538,6 @@ pub(crate) fn semantic_diagnostics_with_reuse() -> Vec<crate::core::Diagnostic> 
             }
         }
     }
-    crate::timing::REUSE_FILES.store(
-        u64::try_from(files.len() - to_check.len()).unwrap_or(u64::MAX),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    crate::timing::RECHECK_FILES.store(
-        u64::try_from(to_check.len()).unwrap_or(u64::MAX),
-        std::sync::atomic::Ordering::Relaxed,
-    );
     let mut checked = if to_check.is_empty() {
         Vec::new()
     } else {

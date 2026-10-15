@@ -101,7 +101,6 @@ fn is_build(args: &[String]) -> bool {
 /// the reply.
 #[must_use]
 pub fn run(request: &str) -> (i32, String) {
-    let _a = ts_goport::timing::Span::new("A_run_total");
     let mut fields = request.split('\0');
     let cwd = normalize_path(fields.next().filter(|cwd| !cwd.is_empty()).unwrap_or("/"));
     let flags: u32 = fields
@@ -180,21 +179,14 @@ pub fn run(request: &str) -> (i32, String) {
     let hooks = WasmTsc {
         diagnostics: diagnostics.clone(),
     };
-    let status = {
-        let _a1 = ts_goport::timing::Span::new("A1_command_line");
-        command_line(&context::background(), sys.clone(), &args, &hooks)
-            .status
-            .code()
-    };
+    let status = command_line(&context::background(), sys.clone(), &args, &hooks)
+        .status
+        .code();
     ts_goport::program::multirun::end_run();
     let _ = sys.writer().borrow_mut().flush();
-    let reply = {
-        let _e = ts_goport::timing::Span::new("E_marshal");
-        diagnostics.map_or_else(String::new, |diagnostics| {
-            format!("[{}]", diagnostics.take().join(","))
-        })
-    };
-    ts_goport::timing::report();
+    let reply = diagnostics.map_or_else(String::new, |diagnostics| {
+        format!("[{}]", diagnostics.take().join(","))
+    });
     // E1: remember the answer of this exact request over this exact host
     // state (see `FINGERPRINT`). The world is hashed again: the run may
     // have written files (an emit), and the replay must not serve a reply
@@ -234,15 +226,6 @@ mod exports {
             input.resize(len, 0);
             input.as_mut_ptr()
         })
-    }
-
-    /// TEMPORARY phase-9 spike: turns the per-run `TIMINGS` stderr line on.
-    #[allow(unsafe_code)]
-    #[unsafe(no_mangle)]
-    pub extern "C" fn ts_debug_timings(enable: i32) {
-        if enable != 0 {
-            ts_goport::timing::enable();
-        }
     }
 
     /// Runs the request in the input buffer and returns the exit status.

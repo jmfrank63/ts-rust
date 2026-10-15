@@ -708,7 +708,6 @@ fn build_program(
     }
     let id = next_program_id();
     let publish = || {
-        let _c2a = crate::timing::Span::new("C2a_publish");
         let go_files = go_files_of_unpublished_stores(&parsed, &cwd, use_case_sensitive_file_names);
         FRONTENDS.with(|frontends| {
             assert!(
@@ -739,10 +738,7 @@ fn build_program(
     // per-file part on two threads while this thread makes and publishes
     // the Go files (`TableParts::build`). Port only: Go has no tables.
     let parts = if replaced.is_none() {
-        Some({
-            let _c2b = crate::timing::Span::new("C2b_tables_full");
-            TableParts::build(np, publish)
-        })
+        Some(TableParts::build(np, publish))
     } else {
         publish();
         None
@@ -770,10 +766,7 @@ fn build_program(
         .and_then(|old| Some((&*old.np, old.tables.go.as_ref()?)));
     let (mut tables, common_source_directory) = match (&previous, &replaced) {
         (Some(old), Some(replaced)) => {
-            let tables = {
-                let _c2b = crate::timing::Span::new("C2b_tables_reused");
-                reused_tables(np, old, replaced)
-            };
+            let tables = reused_tables(np, old, replaced);
             // Go computes it from the file names and the options, which a
             // program that replaces files in place keeps.
             let common_source_directory = old.common_source_directory;
@@ -789,11 +782,8 @@ fn build_program(
             (tables, common_source_directory)
         }
         _ => {
-            let tables = {
-                let _c2c = crate::timing::Span::new("C2c_full_tables_of");
-                let parts = parts.unwrap_or_else(|| TableParts::build(np, || ()));
-                full_tables_of(np, previous_shared, parts)
-            };
+            let parts = parts.unwrap_or_else(|| TableParts::build(np, || ()));
+            let tables = full_tables_of(np, previous_shared, parts);
             let common_source_directory = intern_program_str(&common_source_directory_of(np));
             (tables, common_source_directory)
         }

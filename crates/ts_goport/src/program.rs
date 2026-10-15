@@ -5548,13 +5548,11 @@ pub fn get_diagnostics_of_any_program(
 
     // #4712
     let mut syntactic_diagnostics = Vec::new();
-    let _t9 = std::time::Instant::now();
     append_diagnostics_for_all_files(
         files,
         &mut syntactic_diagnostics,
         &mut get_syntactic_diagnostics,
     );
-    crate::timing::add_us(&crate::timing::SYNTACTIC_US, _t9);
     if !syntactic_diagnostics.is_empty() {
         // Per-file content mapper failures are syntactic diagnostics, but the locationless diagnostic
         // that disables a repeatedly failing mapper must still be reported.
@@ -5565,40 +5563,24 @@ pub fn get_diagnostics_of_any_program(
     // If we didn't have any syntactic errors, then also try getting the program (options),
     // global and semantic errors.
     if all_diagnostics.len() == config_file_parsing_diagnostics_length {
-        let _t9 = std::time::Instant::now();
         all_diagnostics.extend(get_program_diagnostics());
-        crate::timing::add_us(&crate::timing::OPTIONS_US, _t9);
 
         // Do binding early so we can track the time.
-        let _t9 = std::time::Instant::now();
         append_diagnostics_for_all_files(files, &mut Vec::new(), get_bind_diagnostics);
-        crate::timing::add_us(&crate::timing::BIND_US, _t9);
 
         if options.list_files_only.is_false_or_unknown() {
-            let _t9 = std::time::Instant::now();
             all_diagnostics.extend(get_global_diagnostics());
-            crate::timing::add_us(&crate::timing::GLOBAL_US, _t9);
 
             if all_diagnostics.len() == config_file_parsing_diagnostics_length {
-                let _t9 = std::time::Instant::now();
                 append_diagnostics_for_all_files(
                     files,
                     &mut all_diagnostics,
                     get_semantic_diagnostics,
                 );
-                crate::timing::add_us(&crate::timing::SEMANTIC_US, _t9);
-                if let Some(files) = files {
-                    crate::timing::SEMANTIC_FILES.fetch_add(
-                        u64::try_from(files.len()).unwrap_or(u64::MAX),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                }
                 if is_compiler_program {
                     // Incremental programs cache checking globals with file diagnostics;
                     // a late sweep would also collect incidental signature-generation globals.
-                    let _t9 = std::time::Instant::now();
                     all_diagnostics.extend(get_global_diagnostics());
-                    crate::timing::add_us(&crate::timing::GLOBAL_US, _t9);
                 }
             }
 
@@ -5606,13 +5588,11 @@ pub fn get_diagnostics_of_any_program(
                 && options.get_emit_declarations()
                 && all_diagnostics.len() == config_file_parsing_diagnostics_length
             {
-                let _t9 = std::time::Instant::now();
                 append_diagnostics_for_all_files(
                     files,
                     &mut all_diagnostics,
                     get_declaration_diagnostics,
                 );
-                crate::timing::add_us(&crate::timing::DECLARATION_US, _t9);
             }
         }
     }
