@@ -45,6 +45,12 @@ pub static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 /// Microseconds spent parsing on a miss.
 pub static CACHE_PARSE_US: AtomicU64 = AtomicU64::new(0);
 
+/// Semantic-reuse counters of the run (phase 9 step 2).
+pub static REUSE_FILES: AtomicU64 = AtomicU64::new(0);
+pub static RECHECK_FILES: AtomicU64 = AtomicU64::new(0);
+pub static CHANGED_FILES: AtomicU64 = AtomicU64::new(0);
+pub static CACHE_PATHS: AtomicU64 = AtomicU64::new(0);
+
 /// Cumulative check-phase accumulators (phase 9): per-file diagnostics
 /// closures of `emit_files_and_report_errors`. Microseconds, and the file
 /// counts they covered.
@@ -90,6 +96,13 @@ pub fn report() {
     eprintln!(
         "TIMINGS_CACHE hits={hits} misses={misses} parseMs={:.2}",
         f64::from(u32::try_from(parse_us).unwrap_or(u32::MAX)) / 1000.0
+    );
+    eprintln!(
+        "TIMINGS_REUSE reuse={} recheck={} changed={} cachePaths={}",
+        REUSE_FILES.swap(0, Ordering::Relaxed),
+        RECHECK_FILES.swap(0, Ordering::Relaxed),
+        CHANGED_FILES.swap(0, Ordering::Relaxed),
+        CACHE_PATHS.swap(0, Ordering::Relaxed),
     );
     if SEMANTIC_US.load(Ordering::Relaxed) != 0 || BIND_US.load(Ordering::Relaxed) != 0 {
         eprintln!(
