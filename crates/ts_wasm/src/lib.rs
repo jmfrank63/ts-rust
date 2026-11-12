@@ -55,7 +55,12 @@ thread_local! {
 
 pub mod host;
 
-#[cfg(test)]
+// The counting allocator of the wasm tests and the memory soaks.
+#[cfg(all(test, any(target_family = "wasm", feature = "soak")))]
+mod test_alloc;
+
+// Memory soaks of the multi-run flow (measurement only, `#[ignore]`).
+#[cfg(all(test, feature = "soak"))]
 mod soak;
 
 /// Report the diagnostics as JSON in the reply, not as text on stdout.
@@ -540,6 +545,48 @@ mod tests {
         assert_eq!(reply, "[]", "{reply}");
     }
 
+    /// The config parse is reused while the config text stays the same
+    /// (`multirun::cached_config_parse`): a config parse is static, so a
+    /// parse per run was a leak of about 3 KB a run. A changed config
+    /// parses again, and its diagnostics reach the reply.
+    #[test]
+    fn unchanged_config_is_parsed_once() {
+        let _host = HOST.lock().unwrap_or_else(PoisonError::into_inner);
+        let config = |extra: &str| {
+            (
+                "/p/tsconfig.json".to_string(),
+                format!(
+                    r#"{{"compilerOptions":{{"noEmit":true,"types":[]{extra}}},"files":["a.ts"]}}"#
+                ),
+            )
+        };
+        let a = |n: usize| {
+            (
+                "/p/a.ts".to_string(),
+                format!("export const n: number = {n};\n"),
+            )
+        };
+        let request = format!("/p\0{FLAG_DIAGNOSTICS_JSON}\0-p\0.");
+        let _ = ts_goport::program::multirun::take_config_parse_counts();
+        for n in 0..3 {
+            host::test_host::set_files([config(""), a(n)]);
+            let (status, reply) = run(&request);
+            assert_eq!((status, reply.as_str()), (0, "[]"), "run {n}");
+        }
+        let (reused, parsed) = ts_goport::program::multirun::take_config_parse_counts();
+        assert!(
+            parsed <= 1 && reused >= 2,
+            "reused {reused}, parsed {parsed}"
+        );
+        // A changed config: parsed again, and its option error is reported.
+        host::test_host::set_files([config(r#","target":"nope""#), a(9)]);
+        let (status, reply) = run(&request);
+        assert_ne!(status, 0, "{reply}");
+        assert!(reply.contains("target"), "{reply}");
+        let (_, parsed) = ts_goport::program::multirun::take_config_parse_counts();
+        assert_eq!(parsed, 1);
+    }
+
     /// A run whose cwd differs from the one of the instance is rejected
     /// explicitly (`run` documents one cwd per multi-run instance).
     #[test]
@@ -838,8 +885,47 @@ mod tests {
 #[cfg(all(test, target_family = "wasm"))]
 mod wasm_tests {
     use super::*;
-    use crate::soak::LIVE;
+    use crate::test_alloc::LIVE;
     use std::sync::atomic::Ordering;
+
+    /// The synthetic flow nodes that a run's checker makes are freed when
+    /// its program is released (`checker::free_synthetic_flows_of`): wasm
+    /// runs the checkers on the loading thread, which never ends, so they
+    /// were never freed before. A guest whose type predicates are inferred
+    /// from function bodies makes such nodes each run.
+    #[test]
+    fn synthetic_flows_are_freed_across_runs() {
+        let a = |n: usize| {
+            (
+                "/p/a.ts".to_string(),
+                format!(
+                    "export const isText = (x: unknown) => typeof x === 'string';\n\
+                     export const pick = [1, 'a', {n}].filter(x => typeof x === 'number');\n"
+                ),
+            )
+        };
+        let config = (
+            "/p/tsconfig.json".to_string(),
+            r#"{"compilerOptions":{"noEmit":true,"strict":true,"types":[]},"files":["a.ts"]}"#
+                .to_string(),
+        );
+        let mut live = Vec::new();
+        for n in 0..12 {
+            host::test_host::set_files([config.clone(), a(n)]);
+            assert_eq!(
+                run(&format!("/p\0{FLAG_DIAGNOSTICS_JSON}\0-p\0.")),
+                (0, "[]".to_string())
+            );
+            live.push(ts_goport::checker::live_synthetic_flows());
+        }
+        assert!(
+            live[2] > 0,
+            "the guest makes synthetic flow nodes: {live:?}"
+        );
+        // Two versions stay loaded (`multirun::end_run`), so the count
+        // settles after the first runs instead of growing with each run.
+        assert!(live[11] <= live[4], "synthetic flow nodes grow: {live:?}");
+    }
 
     /// A release frees the checker's tables at once. A second release, and
     /// a release of a checker that the pool does not have, change nothing.

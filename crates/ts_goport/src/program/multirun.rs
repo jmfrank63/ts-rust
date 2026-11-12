@@ -132,6 +132,18 @@ thread_local! {
     /// run).
     static CONFIG_PARSES: RefCell<FxHashMap<String, (String, String, Node)>> =
         RefCell::new(FxHashMap::default());
+    /// Config parses reused and made since the last
+    /// `take_config_parse_counts` (the ts_wasm tests).
+    static CONFIG_COUNTS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// PORT: not in Go. Test hook: the config parses that `cached_config_parse`
+/// reused and that `note_config_parse` recorded on this thread since the
+/// last take, as (reused, parsed), and resets them.
+#[doc(hidden)]
+#[must_use]
+pub fn take_config_parse_counts() -> (u64, u64) {
+    CONFIG_COUNTS.with(|counts| counts.replace((0, 0)))
 }
 
 /// PORT: not in Go. The published config parse of `path` when the multi-run
@@ -141,13 +153,15 @@ pub fn cached_config_parse(file_name: &str, path: &str, text: &str) -> Option<No
     if !is_enabled() {
         return None;
     }
-    CONFIG_PARSES.with(|parses| {
-        parses
-            .borrow()
-            .get(path)
-            .filter(|(name, parsed, _)| name == file_name && parsed == text)
-            .map(|&(_, _, node)| node)
-    })
+    CONFIG_PARSES
+        .with(|parses| {
+            parses
+                .borrow()
+                .get(path)
+                .filter(|(name, parsed, _)| name == file_name && parsed == text)
+                .map(|&(_, _, node)| node)
+        })
+        .inspect(|_| CONFIG_COUNTS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1))))
 }
 
 /// PORT: not in Go. Records the config parse `node` of `path` for
@@ -157,10 +171,12 @@ pub fn note_config_parse(file_name: &str, path: &str, text: &str, node: Node) {
         return;
     }
     CONFIG_PARSES.with(|parses| {
-        parses
-            .borrow_mut()
-            .insert(path.to_string(), (file_name.to_string(), text.to_string(), node));
+        parses.borrow_mut().insert(
+            path.to_string(),
+            (file_name.to_string(), text.to_string(), node),
+        );
     });
+    CONFIG_COUNTS.with(|counts| counts.set((counts.get().0, counts.get().1 + 1)));
 }
 
 /// PORT: not in Go. Test hook: takes the parse-cache counters of this

@@ -99,6 +99,20 @@ pub fn free_synthetic_flows_of(program: u32) {
     drop(freed);
 }
 
+/// PORT: not in Go. Test hook: the synthetic flow nodes of this thread that
+/// are not freed (the ts_wasm multi-run test).
+#[doc(hidden)]
+#[must_use]
+pub fn live_synthetic_flows() -> usize {
+    SYNTHETIC_FLOWS.with(|f| {
+        f.borrow()
+            .flows
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count()
+    })
+}
+
 /// Leaks the synthetic flow nodes of this thread instead of freeing them when
 /// the thread ends. A checker worker of a one-program process calls it at the
 /// end of the process, where freeing only costs time (like the checker, see

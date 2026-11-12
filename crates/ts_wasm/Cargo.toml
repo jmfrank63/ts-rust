@@ -12,6 +12,12 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# The memory soaks of the multi-run flow (src/soak.rs): `#[ignore]` tests
+# and an allocation-site trace, whose wasm build imports the `soak` module
+# of scripts/wasm/soak-runner.mjs. Measurement only; CI builds without it.
+soak = []
+
 [dependencies]
 ts_goport = { path = "../ts_goport", default-features = false }
 

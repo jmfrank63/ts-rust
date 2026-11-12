@@ -1,7 +1,16 @@
-// The wasm test runner (scripts/wasm/test-runner.mjs) plus the `soak`
-// imports of crates/ts_wasm/src/soak.rs: a JS-side record of each traced
-// allocation's stack, and a report of the survivors grouped by call site.
-// usage: SOAK_TRACE=1 node soak-runner.mjs <test.wasm> <test args...>
+// Runs the wasm32-wasip1 test binary of crates/ts_wasm built with the `soak`
+// feature: test-runner.mjs plus the `soak` imports of src/soak.rs, which keep
+// a JS stack for each allocation the soak traces (`SOAK_TRACE=1`) and print
+// the growth per call site between the middle and the end of the window.
+// The stack names come from the module's name section (a release test
+// binary keeps it).
+//
+// usage: cargo test -p ts_wasm --release --features soak --target wasm32-wasip1 --no-run
+//        node scripts/wasm/soak-runner.mjs <test.wasm> --ignored --nocapture --test-threads=1 soak::
+// env:   SOAK_DEPTH  JS stack frames captured (default 30)
+//        SOAK_GROUP  frames that key a call site (default 8)
+//        SOAK_TOP    sites printed (default 30)
+//        and the SOAK_* knobs of src/soak.rs
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +20,7 @@ if (isMainThread) {
     process.exitCode = 1;
     const worker = new Worker(new URL(import.meta.url), {
         workerData: process.argv.slice(2),
+        // The trace keeps one record per live traced allocation.
         resourceLimits: { stackSizeMb: 256, maxOldGenerationSizeMb: 8192 },
     });
     worker.on("message", status => (process.exitCode = status));

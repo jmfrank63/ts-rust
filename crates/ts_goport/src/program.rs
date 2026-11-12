@@ -3426,6 +3426,63 @@ pub fn bind_file_outside_program(file: Node) {
     }
 }
 
+/// PORT: not in Go. The index spans of the symbol arenas
+/// (`symbol_index_spans`).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SymbolIndexSpans {
+    /// `SymbolArena::symbol_count` and `table_count` of the binder lineage:
+    /// the next lineage index. `SymbolId` and `SymbolTable` are 32 bits and
+    /// freed lineage ranges are never given again (`free_range`), so these
+    /// only grow over a process.
+    pub lineage_symbols: usize,
+    pub lineage_tables: usize,
+    /// The largest symbol index that a checker of the loading thread made
+    /// (`SymbolArena::own_symbols`; wasm, whose checkers are inline: 0
+    /// natively, where they are on their workers).
+    pub checker_symbols: usize,
+}
+
+/// PORT: not in Go. Measurement hook (the ts_wasm memory soaks): how far
+/// the 32-bit symbol and table index spaces have been used in this
+/// process.
+#[doc(hidden)]
+#[must_use]
+pub fn symbol_index_spans() -> SymbolIndexSpans {
+    let (lineage_symbols, lineage_tables) = LINEAGE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map_or((0, 0), |lineage| {
+            (
+                lineage.symbols.symbol_count(),
+                lineage.symbols.table_count(),
+            )
+        });
+    #[allow(unused_mut)]
+    let mut spans = SymbolIndexSpans {
+        lineage_symbols,
+        lineage_tables,
+        checker_symbols: 0,
+    };
+    #[cfg(target_family = "wasm")]
+    POOLS.with(|pools| {
+        for pool in pools.borrow().values() {
+            for slot in &pool.checkers {
+                if let InlineChecker::Made(checker, _) = slot {
+                    let top = checker
+                        .symbols
+                        .own_symbols()
+                        .last()
+                        .map_or(0, |id| id.0 as usize + 1);
+                    spans.checker_symbols = spans.checker_symbols.max(top);
+                }
+            }
+        }
+    });
+    spans
+}
+
 /// Frees what the loading thread keeps for `program`: it stops the checker
 /// pool (and waits for its workers, which free their checkers and synthetic
 /// nodes), removes the frontend program from this thread and takes the

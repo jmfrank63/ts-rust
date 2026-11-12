@@ -1,73 +1,48 @@
-//! Memory soaks of the multi-run flow (measurement, not CI): the live bytes
-//! of the allocator across many runs of one process, for three guest
-//! patterns. Run them alone, as `#[ignore]` tests:
+//! Memory soaks of the multi-run flow (feature `soak`; measurement, not
+//! CI): the live bytes of the allocator (`test_alloc::LIVE`) and the symbol
+//! index spans (`program::symbol_index_spans`) across many runs of one
+//! instance, for five guest patterns. Run them alone, as `#[ignore]` tests:
 //!
-//!   cargo test -p ts_wasm --release soak -- --ignored --nocapture --test-threads=1
+//! ```text
+//! cargo test -p ts_wasm --release --features soak --target wasm32-wasip1 --no-run
+//! node scripts/wasm/soak-runner.mjs <test.wasm> --ignored --nocapture --test-threads=1 soak::
+//! cargo test -p ts_wasm --release --features soak -- --ignored --nocapture --test-threads=1 soak::
+//! ```
 //!
-//! `LIVE` counts what the allocator holds (allocated, not freed), so a
-//! steady rise is retention, not fragmentation. On native builds,
-//! `SOAK_TRACE=1` also records a backtrace of each allocation made during a
-//! window of runs and prints the ones still live at the end, grouped by
-//! call site.
+//! (the last line is the native run). `LIVE` counts what the allocator
+//! holds, so a steady rise is retention, not fragmentation. A wasm soak of
+//! 300 runs or more fails when its slope passes the cap that its test
+//! passes to `soak`: a regression check, not a claim that the flow holds
+//! no bytes per run.
+//!
+//! `SOAK_TRACE=1` also records the allocation site of each allocation made
+//! in a window of runs. On wasm the runner keeps a JS stack of each one
+//! (the `soak` imports, named by the module's name section) and prints the
+//! growth per site between the middle and the end of the window; natively
+//! a Rust backtrace, and the report is the traced allocations still live at
+//! the end. Knobs: `SOAK_RUNS` (default 400), `SOAK_WINDOW` (runs traced,
+//! default a tenth), `SOAK_TEXT` (text diagnostics instead of JSON).
 #![allow(unsafe_code)]
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
 
-/// The bytes that the process holds: allocated and not yet freed.
-pub static LIVE: AtomicUsize = AtomicUsize::new(0);
-
-/// `System`, counting in `LIVE`.
-pub struct Counting;
-
-// SAFETY: each call goes to `System` with the caller's arguments.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: the caller keeps the `GlobalAlloc::alloc` contract.
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
-            #[cfg(not(target_family = "wasm"))]
-            trace::on_alloc(ptr, layout.size());
-            #[cfg(target_family = "wasm")]
-            wasm_trace::on_alloc(ptr, layout.size());
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        #[cfg(not(target_family = "wasm"))]
-        trace::on_dealloc(ptr);
-        #[cfg(target_family = "wasm")]
-        wasm_trace::on_dealloc(ptr);
-        // SAFETY: the caller keeps the `GlobalAlloc::dealloc` contract.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: the caller keeps the `GlobalAlloc::realloc` contract.
-        let new = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new.is_null() {
-            LIVE.fetch_add(new_size, Ordering::Relaxed);
-            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-            #[cfg(not(target_family = "wasm"))]
-            {
-                trace::on_dealloc(ptr);
-                trace::on_alloc(new, new_size);
-            }
-            #[cfg(target_family = "wasm")]
-            {
-                wasm_trace::on_dealloc(ptr);
-                wasm_trace::on_alloc(new, new_size);
-            }
-        }
-        new
-    }
+/// The allocator hook (`test_alloc`).
+#[inline]
+pub fn on_alloc(ptr: *mut u8, size: usize) {
+    #[cfg(not(target_family = "wasm"))]
+    trace::on_alloc(ptr, size);
+    #[cfg(target_family = "wasm")]
+    wasm_trace::on_alloc(ptr, size);
 }
 
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
+/// The free hook (`test_alloc`).
+#[inline]
+pub fn on_dealloc(ptr: *mut u8) {
+    #[cfg(not(target_family = "wasm"))]
+    trace::on_dealloc(ptr);
+    #[cfg(target_family = "wasm")]
+    wasm_trace::on_dealloc(ptr);
+}
 
 /// Set while the soak records allocation sites (native only).
 static TRACING: AtomicBool = AtomicBool::new(false);
@@ -77,7 +52,7 @@ static TRACING: AtomicBool = AtomicBool::new(false);
 /// module's name section). Only with `SOAK_TRACE`: a binary run by the
 /// plain test runner never calls the imports.
 #[cfg(target_family = "wasm")]
-pub mod wasm_trace {
+mod wasm_trace {
     use super::TRACING;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -153,11 +128,11 @@ mod trace {
             return;
         }
         guarded(|| {
-            let site = Backtrace::force_capture();
+            let stack = Backtrace::force_capture();
             let mut sites = SITES.lock().unwrap_or_else(PoisonError::into_inner);
             sites
                 .get_or_insert_with(HashMap::new)
-                .insert(ptr as usize, (size, site));
+                .insert(ptr as usize, (size, stack));
             ANY.store(true, Ordering::Relaxed);
         });
     }
@@ -175,7 +150,7 @@ mod trace {
     }
 
     /// Prints the live traced allocations, grouped by the first frames of
-    /// their site in ts_goport/ts_wasm, largest group first.
+    /// their site in the goport frames, largest group first.
     pub fn report(runs_traced: usize) {
         INSIDE.with(|inside| inside.set(true));
         let taken = SITES
@@ -189,15 +164,24 @@ mod trace {
             let frames: Vec<&str> = text
                 .lines()
                 .map(str::trim)
-                .filter(|line| line.starts_with("at ") && line.contains("crates/"))
+                // The function line of each frame of the goport crates (a
+                // build with no debuginfo has no `at` lines).
+                .filter_map(|line| line.split_once(": ").map(|(_, name)| name))
+                .filter(|name| name.contains("goport") || name.contains("ts_wasm"))
+                .filter(|name| !name.contains("::soak::") && !name.contains("test_alloc"))
                 .collect();
-            let key = frames.iter().take(6).copied().collect::<Vec<_>>().join("\n    ");
+            let key = frames
+                .iter()
+                .take(6)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n    ");
             let entry = groups.entry(key).or_default();
             entry.0 += size;
             entry.1 += 1;
         }
         let mut groups: Vec<_> = groups.into_iter().collect();
-        groups.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        groups.sort_by_key(|group| std::cmp::Reverse(group.1.0));
         let total: usize = groups.iter().map(|group| group.1.0).sum();
         println!(
             "SOAK-TRACE survivors of {runs_traced} traced runs: {total} B ({} B/run) in {} sites",
@@ -214,12 +198,13 @@ mod trace {
     }
 }
 
-#[cfg(test)]
 mod tests {
-    use super::{LIVE, TRACING};
+    use super::TRACING;
+    use crate::test_alloc::LIVE;
     use crate::{FLAG_DIAGNOSTICS_JSON, host, run};
     use std::fmt::Write as _;
     use std::sync::atomic::Ordering;
+    use ts_goport::program::symbol_index_spans;
 
     /// A guest of about 300 lines: interfaces, classes, generics, unions.
     fn guest(seed: usize) -> String {
@@ -261,16 +246,32 @@ mod tests {
         )
     }
 
+    /// The slope of `samples` over their second half, per run.
+    #[allow(clippy::cast_precision_loss)]
+    fn slope(samples: &[usize]) -> f64 {
+        let half = samples.len() / 2;
+        let last = samples.len() - 1;
+        (samples[last] as f64 - samples[half] as f64) / (last - half) as f64
+    }
+
     /// Runs `runs` runs; `world(i)` sets the host files of run `i`. Prints
-    /// the live bytes at checkpoints and the slope over the second half.
-    fn soak(name: &str, runs: usize, flags: u32, world: impl Fn(usize)) {
+    /// the live bytes at checkpoints, their slope over the second half and
+    /// the symbol index spans, and on wasm fails when the slope passes
+    /// `cap` bytes a run (from 300 runs on: a shorter soak has no settled
+    /// half).
+    fn soak(name: &str, cap: f64, clean: bool, world: impl Fn(usize)) {
+        let runs = env("SOAK_RUNS").unwrap_or(400).max(4);
+        let flags = if std::env::var_os("SOAK_TEXT").is_some() {
+            0
+        } else {
+            FLAG_DIAGNOSTICS_JSON
+        };
         let trace = std::env::var_os("SOAK_TRACE").is_some();
-        let len = std::env::var("SOAK_WINDOW")
-            .ok()
-            .and_then(|len| len.parse().ok())
-            .unwrap_or(runs / 10);
-        let window = (runs / 2)..(runs / 2 + len);
-        let mut samples = Vec::with_capacity(runs);
+        let window = (runs / 2)..(runs / 2 + env("SOAK_WINDOW").unwrap_or(runs / 10).max(2));
+        let mut live = Vec::with_capacity(runs);
+        let mut lineage = Vec::with_capacity(runs);
+        let mut tables = Vec::with_capacity(runs);
+        let mut checker = 0;
         for i in 0..runs {
             world(i);
             if trace && i == window.start {
@@ -285,23 +286,34 @@ mod tests {
                 TRACING.store(false, Ordering::SeqCst);
             }
             assert!(status == 0 || status == 2, "run {i}: {status} {reply}");
-            if i == 0 && flags & FLAG_DIAGNOSTICS_JSON != 0 && !name.starts_with("d-") {
+            if i == 0 && clean && flags & FLAG_DIAGNOSTICS_JSON != 0 {
                 assert_eq!(reply, "[]", "the guest must check clean");
             }
-            samples.push(LIVE.load(Ordering::Relaxed));
+            live.push(LIVE.load(Ordering::Relaxed));
+            let spans = symbol_index_spans();
+            lineage.push(spans.lineage_symbols);
+            tables.push(spans.lineage_tables);
+            checker = checker.max(spans.checker_symbols);
         }
-        let at = |i: usize| samples[i.min(runs - 1)];
-        let half = runs / 2;
-        #[allow(clippy::cast_precision_loss)]
-        let slope = (at(runs - 1) as f64 - at(half) as f64) / (runs - 1 - half) as f64;
-        let checkpoints: Vec<String> = [0, 1, 9, 49, half, runs - 1]
+        let mib = |bytes: usize| {
+            #[allow(clippy::cast_precision_loss)]
+            let mib = bytes as f64 / 1_048_576.0;
+            mib
+        };
+        let checkpoints: Vec<String> = [0, 1, 9, 49, runs / 2, runs - 1]
             .iter()
-            .map(|&i| format!("r{}={:.2}MiB", i + 1, at(i) as f64 / 1_048_576.0))
+            .map(|&i| format!("r{}={:.2}MiB", i + 1, mib(live[i.min(runs - 1)])))
             .collect();
+        let bytes_per_run = slope(&live);
         println!(
-            "SOAK {name}: runs={runs} {} | slope(second half)={:.0} B/run",
+            "SOAK {name}: runs={runs} {} | slope(second half)={bytes_per_run:.0} B/run | \
+             symbol index: lineage +{:.1}/run (end {}), checker max {checker} | \
+             table index: lineage +{:.1}/run (end {})",
             checkpoints.join(" "),
-            slope
+            slope(&lineage),
+            lineage[runs - 1],
+            slope(&tables),
+            tables[runs - 1],
         );
         #[cfg(not(target_family = "wasm"))]
         if trace {
@@ -311,40 +323,44 @@ mod tests {
         if trace {
             super::wasm_trace::print(window.len() - window.len() / 2);
         }
-    }
-
-    fn runs() -> usize {
-        std::env::var("SOAK_RUNS")
-            .ok()
-            .and_then(|runs| runs.parse().ok())
-            .unwrap_or(400)
-    }
-
-    fn flags() -> u32 {
-        if std::env::var_os("SOAK_TEXT").is_some() {
-            0
-        } else {
-            FLAG_DIAGNOSTICS_JSON
+        if cfg!(target_family = "wasm") && runs >= 300 {
+            assert!(
+                bytes_per_run <= cap,
+                "{name}: {bytes_per_run:.0} B/run is over the cap of {cap} B/run"
+            );
         }
     }
 
-    /// (a) The same request over the same files each run.
+    fn env(name: &str) -> Option<usize> {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+    }
+
+    // The caps are about 1.5 to 2 times the slopes measured after the
+    // config-parse reuse and the per-program synthetic flow free (wasm, 600
+    // runs): a: 0, a2: 2.8 KB, b: 0.8 KB, c: 5.2 KB, d: 1.0 KB. What is left
+    // is the symbol link pages of the growing index space and, in c, the
+    // config parse of each new config text (see `multirun::CONFIG_PARSES`).
+
+    /// (a) The same request over the same files each run (replayed).
     #[test]
     #[ignore = "memory soak; run alone"]
     fn soak_a_identical() {
         let text = guest(0);
-        soak("a-identical", runs(), flags(), |_| {
+        soak("a-identical", 256.0, true, |_| {
             host::test_host::set_files([tsconfig(&["a.ts"]), ("/p/a.ts".into(), text.clone())]);
         });
     }
 
-    /// (a') Two alternating worlds: no fingerprint replay, but every parse
-    /// is a cache hit after the first two runs.
+    /// (a2) The 300-line file alternates between two texts: no replay, and
+    /// the parse cache keeps one parse per path, so each run parses and
+    /// binds the file again (a large edit each run).
     #[test]
     #[ignore = "memory soak; run alone"]
     fn soak_a2_alternating() {
         let texts = [guest(0), guest(1)];
-        soak("a2-alternating", runs(), flags(), |i| {
+        soak("a2-alternating", 5_000.0, true, |i| {
             host::test_host::set_files([
                 tsconfig(&["a.ts"]),
                 ("/p/a.ts".into(), texts[i % 2].clone()),
@@ -352,18 +368,41 @@ mod tests {
         });
     }
 
-    /// (b) One file whose text is new each run.
+    /// (b) One small file whose text is new each run.
     #[test]
     #[ignore = "memory soak; run alone"]
     fn soak_b_edited() {
         let base = guest(0);
-        soak("b-edited", runs(), flags(), |i| {
+        soak("b-edited", 2_000.0, true, |i| {
             host::test_host::set_files([
                 tsconfig(&["a.ts", "b.ts"]),
                 ("/p/a.ts".into(), base.clone()),
                 (
                     "/p/b.ts".into(),
-                    format!("import {{ value0 }} from './a';\nexport const b: number = value0 + {i};\n"),
+                    format!(
+                        "import {{ value0 }} from './a';\nexport const b: number = value0 + {i};\n"
+                    ),
+                ),
+            ]);
+        });
+    }
+
+    /// (c) A new file name each run (so a new config text); the previous
+    /// file is gone.
+    #[test]
+    #[ignore = "memory soak; run alone"]
+    fn soak_c_new_name() {
+        let base = guest(0);
+        soak("c-new-name", 9_000.0, true, |i| {
+            let name = format!("n{i}.ts");
+            host::test_host::set_files([
+                tsconfig(&["a.ts", &name]),
+                ("/p/a.ts".into(), base.clone()),
+                (
+                    format!("/p/{name}"),
+                    format!(
+                        "import {{ value0 }} from './a';\nexport const c{i}: number = value0;\n"
+                    ),
                 ),
             ]);
         });
@@ -375,7 +414,7 @@ mod tests {
     #[ignore = "memory soak; run alone"]
     fn soak_d_errors() {
         let base = guest(0);
-        soak("d-errors", runs(), flags(), |i| {
+        soak("d-errors", 2_000.0, false, |i| {
             host::test_host::set_files([
                 tsconfig(&["a.ts", "b.ts"]),
                 ("/p/a.ts".into(), base.clone()),
@@ -387,24 +426,6 @@ mod tests {
                          export const c: Box1<Shape1> = make0(1);\n\
                          export const d: {{ x: number; y: Array<Map<string, Shape1>> }} = {{ x: 'no', y: [] }};\n"
                     ),
-                ),
-            ]);
-        });
-    }
-
-    /// (c) A new file name each run; the previous one is gone.
-    #[test]
-    #[ignore = "memory soak; run alone"]
-    fn soak_c_new_name() {
-        let base = guest(0);
-        soak("c-new-name", runs(), flags(), |i| {
-            let name = format!("n{i}.ts");
-            host::test_host::set_files([
-                tsconfig(&["a.ts", &name]),
-                ("/p/a.ts".into(), base.clone()),
-                (
-                    format!("/p/{name}"),
-                    format!("import {{ value0 }} from './a';\nexport const c{i}: number = value0;\n"),
                 ),
             ]);
         });
