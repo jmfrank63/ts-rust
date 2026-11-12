@@ -120,6 +120,49 @@ thread_local! {
         const { std::cell::Cell::new(ParseCounts { hits: 0, parses: 0 }) };
 }
 
+thread_local! {
+    /// The config file parse of each config path in the multi-run flow,
+    /// with the text it parsed. A config parse is static (its store is
+    /// published for good, `new_tsconfig_source_file_from_file_path`), so
+    /// without this each run leaked a new parse of an unchanged tsconfig
+    /// (about 3 KB a run for a small one, plus its file id). A run whose
+    /// config text is the same reuses the published parse; a changed text
+    /// parses again and replaces the entry (the old parse stays leaked, as
+    /// every static parse does: one per distinct config text, not one per
+    /// run).
+    static CONFIG_PARSES: RefCell<FxHashMap<String, (String, String, Node)>> =
+        RefCell::new(FxHashMap::default());
+}
+
+/// PORT: not in Go. The published config parse of `path` when the multi-run
+/// flow is on and its last parse was of `file_name` with exactly `text`.
+#[must_use]
+pub fn cached_config_parse(file_name: &str, path: &str, text: &str) -> Option<Node> {
+    if !is_enabled() {
+        return None;
+    }
+    CONFIG_PARSES.with(|parses| {
+        parses
+            .borrow()
+            .get(path)
+            .filter(|(name, parsed, _)| name == file_name && parsed == text)
+            .map(|&(_, _, node)| node)
+    })
+}
+
+/// PORT: not in Go. Records the config parse `node` of `path` for
+/// `cached_config_parse` (multi-run flow only).
+pub fn note_config_parse(file_name: &str, path: &str, text: &str, node: Node) {
+    if !is_enabled() {
+        return;
+    }
+    CONFIG_PARSES.with(|parses| {
+        parses
+            .borrow_mut()
+            .insert(path.to_string(), (file_name.to_string(), text.to_string(), node));
+    });
+}
+
 /// PORT: not in Go. Test hook: takes the parse-cache counters of this
 /// thread since the last take and resets them.
 #[doc(hidden)]

@@ -462,13 +462,16 @@ impl CheckerPool {
         let CheckerPool {
             checkers,
             carry: _,
-            program: _,
+            program,
         } = self;
         for slot in checkers {
             if let InlineChecker::Made(checker, mut ids) = slot {
                 ids.run(|| drop(checker));
             }
         }
+        // PORT: not in Go. The checkers ran on this thread, which never
+        // ends: free the synthetic flow nodes they made, as a worker does.
+        crate::checker::free_synthetic_flows_of(program.id);
         Vec::new()
     }
 

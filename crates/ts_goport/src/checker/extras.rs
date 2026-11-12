@@ -8,20 +8,63 @@ use crate::prelude::*;
 /// `&ast.FlowNode{}` values; here a thread-local list owns them.
 pub const SYNTHETIC_FLOW_FILE: usize = 0xffff_ffff;
 
+/// The synthetic flow nodes of a thread. An id is `base` plus the place in
+/// `flows`, and ids are never used again: a freed node's slot is `None`
+/// (a read of it panics), and freed nodes at the front leave the list.
+// PORT: not in Go. wasm runs every checker on the loading thread, which
+// never ends, so the nodes are freed per program (`free_synthetic_flows_of`)
+// instead of with a worker thread: without it each run that refines a
+// parameter leaked its nodes (about 2 KB a run in the ts_wasm soaks).
+struct SyntheticFlows {
+    base: usize,
+    /// Each node with the id of the program that was current when it was
+    /// made (0 for none).
+    flows: std::collections::VecDeque<Option<(u32, Rc<FlowNode>)>>,
+}
+
+impl SyntheticFlows {
+    /// Drops the freed nodes at the front.
+    fn trim(&mut self) {
+        while matches!(self.flows.front(), Some(None)) {
+            self.flows.pop_front();
+            self.base += 1;
+        }
+    }
+}
+
 thread_local! {
-    static SYNTHETIC_FLOWS: RefCell<Vec<Rc<FlowNode>>> = const { RefCell::new(Vec::new()) };
+    static SYNTHETIC_FLOWS: RefCell<SyntheticFlows> = const {
+        RefCell::new(SyntheticFlows {
+            base: 0,
+            flows: std::collections::VecDeque::new(),
+        })
+    };
 }
 
 /// Reads a flow node that `new_synthetic_flow_node` created.
 pub fn synthetic_flow(id: FlowNodeId) -> Rc<FlowNode> {
-    SYNTHETIC_FLOWS.with(|f| Rc::clone(&f.borrow()[id.local_index()]))
+    SYNTHETIC_FLOWS.with(|f| {
+        let f = f.borrow();
+        let slot = id
+            .local_index()
+            .checked_sub(f.base)
+            .and_then(|at| f.flows.get(at))
+            .and_then(Option::as_ref);
+        match slot {
+            Some((_, flow)) => Rc::clone(flow),
+            None => panic!("synthetic flow node {} was freed", id.local_index()),
+        }
+    })
 }
 
 fn push_synthetic_flow(flow: FlowNode) -> FlowNodeId {
+    let program = crate::core::try_prog().map_or(0, |program| program.id);
     SYNTHETIC_FLOWS.with(|f| {
         let mut f = f.borrow_mut();
-        f.push(Rc::new(flow));
-        FlowNodeId::new(SYNTHETIC_FLOW_FILE, f.len() - 1)
+        f.flows.push_back(Some((program, Rc::new(flow))));
+        let index = f.base + f.flows.len() - 1;
+        assert!(index < 0xffff_fffe, "too many synthetic flow nodes");
+        FlowNodeId::new(SYNTHETIC_FLOW_FILE, index)
     })
 }
 
@@ -29,8 +72,31 @@ fn push_synthetic_flow(flow: FlowNode) -> FlowNodeId {
 /// again on this thread. A checker worker of a released program calls it
 /// after dropping its checker (`program::release_program`).
 pub fn free_synthetic_flows() {
-    let flows = SYNTHETIC_FLOWS.with(|f| std::mem::take(&mut *f.borrow_mut()));
+    let flows = SYNTHETIC_FLOWS.with(|f| {
+        let mut f = f.borrow_mut();
+        f.base += f.flows.len();
+        std::mem::take(&mut f.flows)
+    });
     drop(flows);
+}
+
+/// Frees the synthetic flow nodes of this thread that were made while
+/// program `program` was current. wasm: its checker pool stops on this
+/// thread (`program::release_program`), after its checkers drop.
+pub fn free_synthetic_flows_of(program: u32) {
+    let freed: Vec<Rc<FlowNode>> = SYNTHETIC_FLOWS.with(|f| {
+        let mut f = f.borrow_mut();
+        let mut freed = Vec::new();
+        for slot in &mut f.flows {
+            if slot.as_ref().is_some_and(|(of, _)| *of == program) {
+                freed.extend(slot.take().map(|(_, flow)| flow));
+            }
+        }
+        f.trim();
+        freed
+    });
+    // After the borrow: a node can hold the last `Rc` of another.
+    drop(freed);
 }
 
 /// Leaks the synthetic flow nodes of this thread instead of freeing them when
@@ -38,7 +104,11 @@ pub fn free_synthetic_flows() {
 /// end of the process, where freeing only costs time (like the checker, see
 /// `program::create_checkers`).
 pub fn forget_synthetic_flows() {
-    SYNTHETIC_FLOWS.with(|f| std::mem::forget(std::mem::take(&mut *f.borrow_mut())));
+    SYNTHETIC_FLOWS.with(|f| {
+        let mut f = f.borrow_mut();
+        f.base += f.flows.len();
+        std::mem::forget(std::mem::take(&mut f.flows));
+    });
 }
 
 impl Checker {

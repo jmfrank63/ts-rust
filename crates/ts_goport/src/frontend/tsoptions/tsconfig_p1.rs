@@ -506,6 +506,20 @@ pub fn new_tsconfig_source_file_from_file_path(
     config_path: Path,
     config_source_text: &str,
 ) -> TsConfigSourceFile {
+    // PORT: not in Go. The multi-run flow reuses the static parse of an
+    // unchanged config (`program::multirun::cached_config_parse`).
+    if let Some(node) = crate::program::multirun::cached_config_parse(
+        config_file_name,
+        &config_path.0,
+        config_source_text,
+    ) {
+        return TsConfigSourceFile {
+            source_file: node,
+            path: config_path,
+            file_name: config_file_name.to_string(),
+            ..Default::default()
+        };
+    }
     let source_file = Rc::new(parse_source_file(
         &SourceFileParseOptions {
             file_name: config_file_name.to_string(),
@@ -516,6 +530,12 @@ pub fn new_tsconfig_source_file_from_file_path(
         ScriptKind::JSON,
     ));
     crate::program::note_parsed_source_file(&source_file);
+    crate::program::multirun::note_config_parse(
+        config_file_name,
+        &source_file.path().0,
+        config_source_text,
+        source_file.root,
+    );
     TsConfigSourceFile {
         source_file: source_file.root,
         path: source_file.path().clone(),

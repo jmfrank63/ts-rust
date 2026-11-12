@@ -55,6 +55,9 @@ thread_local! {
 
 pub mod host;
 
+#[cfg(test)]
+mod soak;
+
 /// Report the diagnostics as JSON in the reply, not as text on stdout.
 pub const FLAG_DIAGNOSTICS_JSON: u32 = 1;
 /// The host file system ignores case (as on macOS and Windows).
@@ -835,36 +838,8 @@ mod tests {
 #[cfg(all(test, target_family = "wasm"))]
 mod wasm_tests {
     use super::*;
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// The bytes that the test binary holds: allocated and not yet freed.
-    static LIVE: AtomicUsize = AtomicUsize::new(0);
-
-    /// `System`, counting in `LIVE`.
-    struct Counting;
-
-    // SAFETY: each call goes to `System` with the caller's arguments.
-    #[allow(unsafe_code)]
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            // SAFETY: the caller keeps the `GlobalAlloc::alloc` contract.
-            let ptr = unsafe { System.alloc(layout) };
-            if !ptr.is_null() {
-                LIVE.fetch_add(layout.size(), Ordering::Relaxed);
-            }
-            ptr
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-            // SAFETY: the caller keeps the `GlobalAlloc::dealloc` contract.
-            unsafe { System.dealloc(ptr, layout) }
-        }
-    }
-
-    #[global_allocator]
-    static ALLOCATOR: Counting = Counting;
+    use crate::soak::LIVE;
+    use std::sync::atomic::Ordering;
 
     /// A release frees the checker's tables at once. A second release, and
     /// a release of a checker that the pool does not have, change nothing.
